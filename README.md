@@ -41,28 +41,35 @@ POST /api/v1/dashboard/overview/from-klines
 
 ```text
 Project_Flutter/
-├── lib/
-│   └── main.dart            # 前端主程式、API 串接及圖表
-├── docs/
-│   └── api-contract.md      # 先前整理的 API 欄位筆記
-├── pubspec.yaml             # Flutter 套件設定
-├── SOURCE_ATTRIBUTION.md    # 團隊程式來源
+├── lib/main.dart            # 前端畫面、API 串接與圖表
+├── web/                     # Flutter Web 入口及圖示
+├── android/、ios/           # 行動平台設定
+├── windows/、linux/、macos/ # 桌面平台設定
+├── test/widget_test.dart    # 畫面與 K 線互動測試
+├── docs/api-contract.md     # 前後端 API 欄位紀錄
+├── pubspec.yaml             # Flutter 依賴設定
+├── pubspec.lock             # 已解析的套件版本
+├── analysis_options.yaml   # Dart 分析規則
+├── SOURCE_ATTRIBUTION.md    # 團隊程式來源紀錄
 └── README.md
 ```
+
+`build/` 是 Flutter 編譯時產生的檔案，不需要放進 GitHub；相關平台與原始碼已保留。
 
 `docs/api-contract.md` 已依目前的 POST API、後端回傳欄位與 K 線資料格式更新，串接方式請參考該文件與 `lib/main.dart`。
 
 ## 在本機執行
 
-需要先安裝 Flutter SDK 和 Chrome。此儲存庫沒有完整的 Flutter Web 平台產生檔案，第一次使用時請先建立：
+需要安裝 Flutter SDK 與 Chrome，並確保 Flutter 所附的 Dart SDK 符合專案的版本要求（目前 `pubspec.yaml` 設定 `^3.12.2`）。專案已包含 Flutter Web 與其他平台設定，下載後可直接安裝依賴並執行：
 
 ```bash
 git clone https://github.com/marinesea99/Project_Flutter.git
 cd Project_Flutter
-flutter create --platforms=web .
 flutter pub get
 flutter run -d chrome
 ```
+
+如需執行儲存庫中的測試，可使用 `flutter test`；測試通過與否仍須在本機環境確認。
 
 如需指定另一個後端：
 

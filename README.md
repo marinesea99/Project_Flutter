@@ -50,7 +50,7 @@ Project_Flutter/
 └── README.md
 ```
 
-`docs/api-contract.md` 是較早期的欄位紀錄，部分內容尚未與目前的 POST API 同步；目前程式行為請以 `lib/main.dart` 及後端實作為準。
+`docs/api-contract.md` 已依目前的 POST API、後端回傳欄位與 K 線資料格式更新，串接方式請參考該文件與 `lib/main.dart`。
 
 ## 在本機執行
 

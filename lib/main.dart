@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
@@ -36,19 +37,19 @@ class CryptoDashboardApp extends StatelessWidget {
 // 1. 單一穩定幣模型資料
 // ============================================================
 
-/// USDC 或 TUSD 的單一預測模型五項資料。
+/// USDC 或 TUSD 的單一模型五項輸出。
 class StablecoinModelMetrics {
   final double currentPrice;
   final double future6hLow;
   final double priceDiff;
-  final double depegProbability;
+  final double riskScore;
   final String riskLevel;
 
   const StablecoinModelMetrics({
     required this.currentPrice,
     required this.future6hLow,
     required this.priceDiff,
-    required this.depegProbability,
+    required this.riskScore,
     required this.riskLevel,
   });
 
@@ -68,10 +69,7 @@ class StablecoinModelMetrics {
       currentPrice: _readDouble(payload, '${prefix}_current_price'),
       future6hLow: _readDouble(payload, '${prefix}_future_6h_low'),
       priceDiff: _readDouble(payload, '${prefix}_price_diff'),
-      depegProbability: _readProbability(
-        payload,
-        '${prefix}_depeg_probability',
-      ),
+      riskScore: _readRiskScore(payload, '${prefix}_depeg_probability'),
       riskLevel: _readText(payload, '${prefix}_risk_level'),
     );
   }
@@ -104,10 +102,10 @@ class StablecoinModelMetrics {
     throw FormatException('欄位 $key 不是有效數字，收到：$value');
   }
 
-  /// 後端的 depeg_probability 已經是百分比數值。
+  /// 後端沿用 depeg_probability 欄位名稱，但畫面只將數值視為風險分數。
   ///
-  /// 例如後端回傳 25 或 "25%"，前端都保留為 25。
-  static double _readProbability(Map<String, dynamic> json, String key) {
+  /// 例如後端回傳 25 或 "25%"，前端都轉成 0 到 100 的分數。
+  static double _readRiskScore(Map<String, dynamic> json, String key) {
     return _readDouble(json, key).clamp(0.0, 100.0).toDouble();
   }
 
@@ -130,217 +128,7 @@ class StablecoinModelMetrics {
 }
 
 // ============================================================
-// 2. API 服務
-// ============================================================
-
-/// 同時載入摘要與 K 線時共用正在進行的 overview 請求。
-/// 完成後不快取，下次按重新抓取仍會向後端取得新資料。
-class DashboardOverviewApi {
-  static Future<Map<String, dynamic>>? _inFlight;
-
-  static Future<Map<String, dynamic>> fetchData() async {
-    final pending = _inFlight ??= _fetchData();
-    try {
-      return await pending;
-    } finally {
-      if (identical(_inFlight, pending)) _inFlight = null;
-    }
-  }
-
-  static Future<Map<String, dynamic>> _fetchData() async {
-    if (StablecoinRiskApi.baseUrl.trim().isEmpty) {
-      throw StateError('請使用 --dart-define=API_BASE_URL 設定後端網址');
-    }
-    final uri = Uri.parse(
-      '${StablecoinRiskApi.baseUrl}${StablecoinRiskApi.riskPath}',
-    );
-    final response = await http
-        .get(uri, headers: const {'Accept': 'application/json'})
-        .timeout(const Duration(seconds: 15));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('API 呼叫失敗：HTTP ${response.statusCode}');
-    }
-    final dynamic decoded = jsonDecode(utf8.decode(response.bodyBytes));
-    if (decoded is! Map) {
-      throw const FormatException('API 回傳的 JSON 根節點必須是物件');
-    }
-    final root = Map<String, dynamic>.from(decoded);
-    if (root['success'] == false) {
-      throw Exception(root['message'] ?? root['error'] ?? '後端回報資料取得失敗');
-    }
-    if (root['data'] is Map) {
-      final data = Map<String, dynamic>.from(root['data'] as Map);
-      // 保留後端回應時間，用同一個資料快照判斷 K 棒是否已收盤。
-      // 不使用畫面重繪時間，以免舊資料跨小時後被誤認為新收盤資料。
-      data['_overview_timestamp'] = root['timestamp'];
-      return data;
-    }
-    // 保留舊版直接回傳資料的包裝格式。
-    return root;
-  }
-}
-
-class StablecoinRiskApi {
-  static const String baseUrl = String.fromEnvironment('API_BASE_URL');
-  static const String riskPath = '/api/v1/dashboard/overview';
-
-  static Future<Map<String, dynamic>> fetchPayload() async {
-    final data = await DashboardOverviewApi.fetchData();
-    if (data['stablecoins'] is Map) {
-      return Map<String, dynamic>.from(data['stablecoins'] as Map);
-    }
-    return data;
-  }
-}
-
-// ============================================================
-// 2-1. 一般加密貨幣（BTC / ETH / SOL / XRP）趨勢資料
-// ============================================================
-
-/// data.cryptos 陣列中的一個幣種。
-/// up_score 是後端的上漲分數；不將它改名為上漲機率。
-class CryptoOverviewData {
-  final String coin;
-  final int predictionHorizonHours;
-  final double upScore;
-  final String trendLabel;
-  final double displayThreshold;
-  final String klineInterval;
-  final List<CandlestickData> candles;
-  final DateTime dataAsOf;
-
-  const CryptoOverviewData({
-    required this.coin,
-    required this.predictionHorizonHours,
-    required this.upScore,
-    required this.trendLabel,
-    required this.displayThreshold,
-    required this.klineInterval,
-    required this.candles,
-    required this.dataAsOf,
-  });
-
-  factory CryptoOverviewData.fromPayload(
-    Map<String, dynamic> payload, {
-    DateTime? dataAsOf,
-  }) {
-    final hours = _readDouble(payload, 'prediction_horizon_hours');
-    if (hours <= 0 || hours != hours.truncateToDouble()) {
-      throw const FormatException('prediction_horizon_hours 必須是正整數');
-    }
-    final score = _readDouble(payload, 'up_score');
-    final threshold = _readDouble(payload, 'display_threshold');
-    if (score < 0 || score > 100 || threshold < 0 || threshold > 100) {
-      throw const FormatException('up_score 與 display_threshold 必須介於 0～100');
-    }
-    final coin = _readString(payload, 'coin').toUpperCase();
-    final rows = payload['kline_data'];
-    if (rows is! List) {
-      throw FormatException('$coin 缺少 kline_data 陣列');
-    }
-    return CryptoOverviewData(
-      coin: coin,
-      predictionHorizonHours: hours.toInt(),
-      upScore: score,
-      trendLabel: _readString(payload, 'trend_label'),
-      displayThreshold: threshold,
-      klineInterval: _readString(payload, 'kline_interval'),
-      candles: KlineApi.parseCandles(rows, '$coin.kline_data'),
-      dataAsOf: dataAsOf ?? DateTime.now(),
-    );
-  }
-
-  /// JSON time 是 K 棒起始時間，例如 22:00 的 1h K 棒在 23:00 收盤。
-  /// 以 API 回應時間為準，找到最近一根完整收盤的 K 棒。
-  /// 此值用來推算模型資料截至時間；不是後端獨立提供的模型時間戳。
-  CandlestickData? get latestClosedCandle {
-    final match = RegExp(r'^(\d+)([mhdw])$').firstMatch(klineInterval);
-    if (match == null) return null;
-    final count = int.parse(match.group(1)!);
-    if (count <= 0) return null;
-    final Duration interval;
-    switch (match.group(2)!) {
-      case 'm':
-        interval = Duration(minutes: count);
-        break;
-      case 'h':
-        interval = Duration(hours: count);
-        break;
-      case 'd':
-        interval = Duration(days: count);
-        break;
-      case 'w':
-        interval = Duration(days: count * 7);
-        break;
-      default:
-        return null;
-    }
-    for (final candle in candles.reversed) {
-      if (!candle.time.add(interval).isAfter(dataAsOf)) return candle;
-    }
-    return null;
-  }
-
-  double get scoreDifference => upScore - displayThreshold;
-
-  static double _readDouble(Map<String, dynamic> json, String key) {
-    final value = json[key];
-    final parsed = value is num
-        ? value.toDouble()
-        : value is String
-            ? double.tryParse(value.trim().replaceAll(',', ''))
-            : null;
-    if (parsed != null && parsed.isFinite) return parsed;
-    throw FormatException('加密貨幣欄位 $key 不是有效數字，收到：$value');
-  }
-
-  static String _readString(Map<String, dynamic> json, String key) {
-    final value = json[key];
-    if (value is! String || value.trim().isEmpty) {
-      throw FormatException('加密貨幣 JSON 缺少有效文字欄位：$key');
-    }
-    return value.trim();
-  }
-}
-
-class CryptoOverviewApi {
-  /// 新版格式：data.cryptos 是陣列，每個物件帶自己的 kline_data。
-  static List<Map<String, dynamic>> readRows(Map<String, dynamic> data) {
-    final value = data['cryptos'];
-    if (value is! List) {
-      throw const FormatException('JSON 的 data.cryptos 必須是陣列');
-    }
-    return value.map((row) {
-      if (row is! Map) {
-        throw const FormatException('cryptos 陣列的每一筆資料必須是物件');
-      }
-      return Map<String, dynamic>.from(row);
-    }).toList(growable: false);
-  }
-
-  static Map<String, CryptoOverviewData> parseData(Map<String, dynamic> data) {
-    final result = <String, CryptoOverviewData>{};
-    final timestamp = data['_overview_timestamp'] ?? data['timestamp'];
-    final dataAsOf = timestamp is String
-        ? DateTime.tryParse(timestamp.trim()) ?? DateTime.now()
-        : DateTime.now();
-    for (final row in readRows(data)) {
-      final item = CryptoOverviewData.fromPayload(row, dataAsOf: dataAsOf);
-      if (result.containsKey(item.coin)) {
-        throw FormatException('cryptos 出現重複幣種：${item.coin}');
-      }
-      result[item.coin] = item;
-    }
-    return result;
-  }
-
-  static Future<Map<String, CryptoOverviewData>> fetchPayload() async {
-    return parseData(await DashboardOverviewApi.fetchData());
-  }
-}
-
-// ============================================================
-// 2-2. K 線資料與 API 服務
+// 2. 儀表板資料模型與 API
 // ============================================================
 
 /// 後端單一時間週期的 OHLCV 資料。
@@ -406,7 +194,7 @@ class CandlestickData {
     final value = _valueFor(json, key);
 
     if (value == null && !required) return 0;
-    if (value is num && value.isFinite) return value.toDouble();
+    if (value is num) return value.toDouble();
 
     if (value is String) {
       final parsed = double.tryParse(value.trim().replaceAll(',', ''));
@@ -442,52 +230,366 @@ class CandlestickData {
   }
 }
 
-class KlineApi {
-  /// 穩定幣：data.stablecoins.<coin>_kline_data。
-  /// 加密貨幣：data.cryptos[i].kline_data，以 coin 決定對應幣種。
-  static Future<Map<String, List<CandlestickData>>> fetchCandles() async {
-    return parseData(await DashboardOverviewApi.fetchData());
-  }
+class StablecoinModelDefinition {
+  final String displayName;
+  final List<String> components;
+  final Map<String, int> featureCounts;
 
-  static Map<String, List<CandlestickData>> parseData(Map<String, dynamic> data) {
-    final stablecoinPayload = data['stablecoins'] is Map
-        ? Map<String, dynamic>.from(data['stablecoins'] as Map)
-        : data;
-    final result = <String, List<CandlestickData>>{};
+  const StablecoinModelDefinition({
+    required this.displayName,
+    required this.components,
+    required this.featureCounts,
+  });
+
+  factory StablecoinModelDefinition.fromPayload(Map<String, dynamic> payload) {
+    final rawComponents = payload['components'];
+    final rawFeatureCounts = payload['feature_counts'];
+    return StablecoinModelDefinition(
+      displayName: payload['display_name']?.toString() ?? '未知模型',
+      components: rawComponents is List
+          ? rawComponents.map((value) => value.toString()).toList()
+          : const [],
+      featureCounts: rawFeatureCounts is Map
+          ? Map<String, int>.fromEntries(
+              rawFeatureCounts.entries.map(
+                (entry) => MapEntry(
+                  entry.key.toString(),
+                  (entry.value as num).toInt(),
+                ),
+              ),
+            )
+          : const {},
+    );
+  }
+}
+
+class StablecoinRegressionDefinition {
+  final String displayName;
+  final int featureCount;
+
+  const StablecoinRegressionDefinition({
+    required this.displayName,
+    required this.featureCount,
+  });
+
+  factory StablecoinRegressionDefinition.fromPayload(
+    Map<String, dynamic> payload,
+  ) {
+    return StablecoinRegressionDefinition(
+      displayName: payload['display_name']?.toString() ?? '未知模型',
+      featureCount: (payload['feature_count'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class StablecoinModelInfo {
+  final int predictionHorizonHours;
+  final String predictionTarget;
+  final String klineInterval;
+  final int inputKlineCount;
+  final double? validationRocAuc;
+  final String datasetPeriod;
+  final Map<String, StablecoinModelDefinition> models;
+  final List<StablecoinRegressionDefinition> regressionModels;
+
+  const StablecoinModelInfo({
+    required this.predictionHorizonHours,
+    required this.predictionTarget,
+    required this.klineInterval,
+    required this.inputKlineCount,
+    required this.validationRocAuc,
+    required this.datasetPeriod,
+    required this.models,
+    required this.regressionModels,
+  });
+
+  factory StablecoinModelInfo.fromPayload(Map<String, dynamic> payload) {
+    final models = <String, StablecoinModelDefinition>{};
+    final rawModels = payload['models'];
+    if (rawModels is List) {
+      for (final rawModel in rawModels) {
+        if (rawModel is! Map) continue;
+        final model = StablecoinModelDefinition.fromPayload(
+          Map<String, dynamic>.from(rawModel),
+        );
+        models[model.displayName] = model;
+      }
+    }
+    final regressionModels = <StablecoinRegressionDefinition>[];
+    final rawRegressionModels = payload['regression_models'];
+    if (rawRegressionModels is List) {
+      for (final rawModel in rawRegressionModels) {
+        if (rawModel is! Map) continue;
+        regressionModels.add(
+          StablecoinRegressionDefinition.fromPayload(
+            Map<String, dynamic>.from(rawModel),
+          ),
+        );
+      }
+    }
+
+    return StablecoinModelInfo(
+      predictionHorizonHours: (payload['prediction_horizon_hours'] as num)
+          .toInt(),
+      predictionTarget: payload['prediction_target'].toString(),
+      klineInterval: payload['kline_interval'].toString(),
+      inputKlineCount: (payload['input_kline_count'] as num).toInt(),
+      validationRocAuc: payload['validation_roc_auc'] is num
+          ? (payload['validation_roc_auc'] as num).toDouble()
+          : null,
+      datasetPeriod:
+          payload['dataset_period']?.toString() ??
+          '2023～2025 年 Binance 1h K 線資料',
+      models: models,
+      regressionModels: regressionModels,
+    );
+  }
+}
+
+class CryptoModelInfo {
+  final String modelName;
+  final String predictionTarget;
+  final String targetDefinition;
+  final int predictionHorizonHours;
+  final int inputKlineCount;
+  final int featureCount;
+  final double displayThreshold;
+  final double? validationRocAuc;
+  final Map<String, String> trainingCoverage;
+
+  const CryptoModelInfo({
+    required this.modelName,
+    required this.predictionTarget,
+    required this.targetDefinition,
+    required this.predictionHorizonHours,
+    required this.inputKlineCount,
+    required this.featureCount,
+    required this.displayThreshold,
+    required this.validationRocAuc,
+    required this.trainingCoverage,
+  });
+
+  factory CryptoModelInfo.fromPayload(Map<String, dynamic> payload) {
+    final rawCoverage = payload['training_coverage'];
+    return CryptoModelInfo(
+      modelName: payload['model_name'].toString(),
+      predictionTarget: payload['prediction_target'].toString(),
+      targetDefinition: payload['target_definition'].toString(),
+      predictionHorizonHours: (payload['prediction_horizon_hours'] as num)
+          .toInt(),
+      inputKlineCount: (payload['input_kline_count'] as num).toInt(),
+      featureCount: (payload['feature_count'] as num).toInt(),
+      displayThreshold: (payload['display_threshold'] as num).toDouble(),
+      validationRocAuc: payload['validation_roc_auc'] is num
+          ? (payload['validation_roc_auc'] as num).toDouble()
+          : null,
+      trainingCoverage: rawCoverage is Map
+          ? rawCoverage.map(
+              (key, value) => MapEntry(key.toString(), value.toString()),
+            )
+          : const {},
+    );
+  }
+}
+
+class CryptoOverviewData {
+  final String coin;
+  final double currentPrice;
+  final double upScore;
+  final double thresholdGap;
+  final String trendLabel;
+  final String modelDataUntil;
+  final String klineInterval;
+  final List<CandlestickData> klineData;
+  final CryptoModelInfo modelInfo;
+
+  const CryptoOverviewData({
+    required this.coin,
+    required this.currentPrice,
+    required this.upScore,
+    required this.thresholdGap,
+    required this.trendLabel,
+    required this.modelDataUntil,
+    required this.klineInterval,
+    required this.klineData,
+    required this.modelInfo,
+  });
+
+  factory CryptoOverviewData.fromPayload(Map<String, dynamic> payload) {
+    final rawKlines = payload['kline_data'];
+    final rawModelInfo = payload['model_info'];
+    if (rawKlines is! List || rawModelInfo is! Map) {
+      throw const FormatException('加密貨幣資料缺少 kline_data 或 model_info');
+    }
+
+    return CryptoOverviewData(
+      coin: payload['coin'].toString(),
+      currentPrice: (payload['current_price'] as num).toDouble(),
+      upScore: (payload['up_score'] as num).toDouble(),
+      thresholdGap: (payload['threshold_gap'] as num).toDouble(),
+      trendLabel: payload['trend_label'].toString(),
+      modelDataUntil: payload['model_data_until'].toString(),
+      klineInterval: payload['kline_interval'].toString(),
+      klineData: DashboardApi.parseCandles(rawKlines, 'kline_data'),
+      modelInfo: CryptoModelInfo.fromPayload(
+        Map<String, dynamic>.from(rawModelInfo),
+      ),
+    );
+  }
+}
+
+class DashboardSnapshot {
+  final Map<String, dynamic> stablecoinPayload;
+  final Map<String, StablecoinModelInfo> stablecoinModelInfo;
+  final Map<String, CryptoOverviewData> cryptos;
+  final Map<String, List<CandlestickData>> klines;
+
+  const DashboardSnapshot({
+    required this.stablecoinPayload,
+    required this.stablecoinModelInfo,
+    required this.cryptos,
+    required this.klines,
+  });
+}
+
+class DashboardApi {
+  static const String backendBaseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'https://quantproject-backend.onrender.com',
+  );
+  static const String overviewPath = '/api/v1/dashboard/overview/from-klines';
+  static const String binanceBaseUrl =
+      'https://data-api.binance.vision/api/v3/klines';
+  static const Map<String, int> _symbolLimits = {
+    'USDCUSDT': 100,
+    'TUSDUSDT': 100,
+    'BTCUSDT': 300,
+    'ETHUSDT': 300,
+    'SOLUSDT': 300,
+    'XRPUSDT': 300,
+  };
+
+  static Future<DashboardSnapshot> fetchSnapshot() async {
+    final entries = await Future.wait(
+      _symbolLimits.entries.map((entry) async {
+        final uri = Uri.parse(binanceBaseUrl).replace(
+          queryParameters: {
+            'symbol': entry.key,
+            'interval': '1h',
+            'limit': entry.value.toString(),
+          },
+        );
+        final response = await http
+            .get(uri, headers: const {'Accept': 'application/json'})
+            .timeout(const Duration(seconds: 25));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception(
+            'Binance ${entry.key} K 線讀取失敗：HTTP ${response.statusCode}',
+          );
+        }
+        final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+        if (decoded is! List || decoded.isEmpty) {
+          throw FormatException('Binance ${entry.key} 沒有回傳有效 K 線');
+        }
+        return MapEntry(entry.key, decoded);
+      }),
+    );
+
+    final uri = Uri.parse('$backendBaseUrl$overviewPath');
+    final response = await http
+        .post(
+          uri,
+          headers: const {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'klines': Map.fromEntries(entries)}),
+        )
+        .timeout(const Duration(seconds: 180));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+        '後端 API 呼叫失敗：HTTP ${response.statusCode}\n${response.body}',
+      );
+    }
+
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    if (decoded is! Map) {
+      throw const FormatException('後端 API 回傳的 JSON 根節點必須是物件');
+    }
+    final root = Map<String, dynamic>.from(decoded);
+    if (root['success'] != true) {
+      throw Exception('後端推論失敗：${root['error_message'] ?? '未知錯誤'}');
+    }
+    final rawData = root['data'];
+    if (rawData is! Map) {
+      throw const FormatException('後端 JSON 缺少 data 物件');
+    }
+    final data = Map<String, dynamic>.from(rawData);
+    final rawStablecoins = data['stablecoins'];
+    final rawCryptos = data['cryptos'];
+    if (rawStablecoins is! Map || rawCryptos is! List) {
+      throw const FormatException('後端 JSON 缺少 stablecoins 或 cryptos');
+    }
+
+    final stablecoinPayload = Map<String, dynamic>.from(rawStablecoins);
+    final stablecoinInfo = <String, StablecoinModelInfo>{};
+    final rawStablecoinInfo = stablecoinPayload['model_info'];
+    if (rawStablecoinInfo is Map) {
+      for (final entry in rawStablecoinInfo.entries) {
+        if (entry.value is Map) {
+          stablecoinInfo[entry.key
+              .toString()] = StablecoinModelInfo.fromPayload(
+            Map<String, dynamic>.from(entry.value as Map),
+          );
+        }
+      }
+    }
+
+    final cryptos = <String, CryptoOverviewData>{};
+    for (final rawCrypto in rawCryptos) {
+      if (rawCrypto is! Map) continue;
+      final crypto = CryptoOverviewData.fromPayload(
+        Map<String, dynamic>.from(rawCrypto),
+      );
+      cryptos[crypto.coin] = crypto;
+    }
+
+    final klines = <String, List<CandlestickData>>{};
     for (final coin in const ['USDC', 'TUSD']) {
       final key = '${coin.toLowerCase()}_kline_data';
       final rows = stablecoinPayload[key];
-      if (rows is List) result[coin] = parseCandles(rows, key);
+      if (rows is List) klines[coin] = parseCandles(rows, key);
     }
-    if (data.containsKey('cryptos')) {
-      for (final row in CryptoOverviewApi.readRows(data)) {
-        final coin = CryptoOverviewData._readString(row, 'coin').toUpperCase();
-        final rows = row['kline_data'];
-        if (rows is! List) {
-          throw FormatException('$coin 缺少 kline_data 陣列');
-        }
-        if (result.containsKey(coin)) {
-          throw FormatException('K 線出現重複幣種：$coin');
-        }
-        result[coin] = parseCandles(rows, '$coin.kline_data');
-      }
+    for (final crypto in cryptos.values) {
+      klines[crypto.coin] = crypto.klineData;
     }
-    if (result.isEmpty) {
-      throw const FormatException('JSON 找不到任何幣種的 K 線陣列');
-    }
-    return result;
+
+    return DashboardSnapshot(
+      stablecoinPayload: stablecoinPayload,
+      stablecoinModelInfo: stablecoinInfo,
+      cryptos: cryptos,
+      klines: klines,
+    );
   }
 
   static List<CandlestickData> parseCandles(List rows, String jsonKey) {
-    final uniqueByTime = <int, CandlestickData>{};
-    for (final row in rows) {
+    final parsed = rows.map((row) {
       if (row is! Map) {
         throw FormatException('$jsonKey 中的每一筆資料都必須是物件');
       }
-      final candle = CandlestickData.fromJson(Map<String, dynamic>.from(row));
+      return CandlestickData.fromJson(Map<String, dynamic>.from(row));
+    }).toList()..sort((a, b) => a.time.compareTo(b.time));
+
+    if (parsed.isEmpty) {
+      throw FormatException('$jsonKey 沒有任何資料');
+    }
+
+    final uniqueByTime = <int, CandlestickData>{};
+    for (final candle in parsed) {
       uniqueByTime[candle.time.millisecondsSinceEpoch] = candle;
     }
-    // 空陣列顯示尚無資料；不讓單一幣種無 K 線時阻擋其他幣種。
+
     return uniqueByTime.values.toList()
       ..sort((a, b) => a.time.compareTo(b.time));
   }
@@ -508,10 +610,32 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   final ScrollController _pageScrollController = ScrollController();
 
   // 模型顯示名稱。
-  static const String modelEnsemble = 'XGBoost+Transformer';
   static const String modelTransformer0995 = 'Transformer0.995';
   static const String modelTransformer099 = 'Transformer0.99';
   static const String modelXGBoost = 'XGBoost';
+
+  String _displayModelName(String modelName) {
+    if (modelName == modelTransformer0995) return 'Transformer 0.995';
+    if (modelName == modelTransformer099) return 'Transformer 0.99';
+    return modelName;
+  }
+
+  String _classificationTarget(String coin, String modelName) {
+    if (coin == 'USDC') {
+      if (modelName == modelTransformer0995) {
+        return '未來 6 小時最低收盤價是否低於 0.995';
+      }
+      if (modelName == modelTransformer099) {
+        return '未來 6 小時最低收盤價是否低於 0.99';
+      }
+      return '未來 6 小時最低收盤價是否低於 0.995';
+    }
+
+    if (modelName == modelTransformer0995) {
+      return '未來 24 小時最低價是否低於 0.995';
+    }
+    return '未來 24 小時最低價是否低於 0.99';
+  }
 
   /// 模型顯示名稱對應 JSON 中的模型代稱。
   ///
@@ -519,13 +643,13 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   /// USDC + ensemble -> usdc_ensemble
   /// TUSD + xgboost -> tusd_xgboost
   static const Map<String, String> modelJsonSuffixes = {
-    modelEnsemble: 'ensemble',
     modelTransformer0995: 'transformer_0995',
     modelTransformer099: 'transformer_099',
     modelXGBoost: 'xgboost',
   };
 
   String? hoveredCategory;
+  String? expandedCategory;
   String? selectedCategory;
 
   /// 幣種與模型皆支援複選。
@@ -541,18 +665,20 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   bool isKlineLoading = false;
   String? klineErrorMessage;
   DateTime? klineLastUpdatedAt;
-  int _klineRequestSerial = 0;
+  CandlestickData? inspectedKlineCandle;
+  String? inspectedKlineCoin;
 
   /// 第一層 key 是幣種，第二層 key 是模型顯示名稱。
   /// 例如：modelRiskData['USDC']?['XGBoost']。
   Map<String, Map<String, StablecoinModelMetrics>> modelRiskData = {};
+  Map<String, dynamic> stablecoinPayload = {};
+  Map<String, StablecoinModelInfo> stablecoinModelInfoByCoin = {};
 
-  /// 以幣種為 key 保存四種加密貨幣的趨勢摘要。
+  /// data.cryptos 的 BTC、ETH、SOL、XRP 預測資料。
   Map<String, CryptoOverviewData> cryptoOverviewByCoin = {};
   bool isCryptoLoading = false;
   String? cryptoErrorMessage;
   DateTime? cryptoLastUpdatedAt;
-  int _cryptoRequestSerial = 0;
 
   /// 用來忽略較舊的非同步 API 回應。
   int _requestSerial = 0;
@@ -561,7 +687,6 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   final List<String> stableCoins = ['USDC', 'TUSD'];
 
   final List<String> models = const [
-    modelEnsemble,
     modelTransformer0995,
     modelTransformer099,
     modelXGBoost,
@@ -571,7 +696,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   void initState() {
     super.initState();
     // K 線不在頁面初始化時載入。
-    // 選到 USDC/TUSD 或 BTC/ETH/SOL/XRP 後才會抓取並顯示。
+    // 左側選到任一幣種後才會抓取並顯示。
   }
 
   @override
@@ -591,7 +716,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     return selectedCoins.where(stableCoins.contains).toList(growable: false);
   }
 
-  /// 目前選取的一般加密貨幣，支援四種幣複選。
+  /// 目前選取的一般加密貨幣。
   List<String> get selectedCryptos {
     if (!isCryptoCategory) {
       return const [];
@@ -600,7 +725,6 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   }
 
   bool get hasSelectedStablecoin => selectedStablecoins.isNotEmpty;
-  bool get hasSelectedCrypto => selectedCryptos.isNotEmpty;
 
   /// 目前畫面可以切換顯示 K 線的幣種。
   List<String> get selectedKlineCoins {
@@ -621,9 +745,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   }
 
   bool get canRefreshSelectedData {
-    if (isStableCoinCategory) return canLoadStablecoinData;
-    if (isCryptoCategory) return hasSelectedCrypto;
-    return false;
+    return selectedCoins.isNotEmpty;
   }
 
   bool get isSelectedDataLoading =>
@@ -644,198 +766,106 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   // 4. API 載入與選項控制
   // ==========================================================
 
-  Future<void> _loadKlineData() async {
-    // 目前分類有任何已選幣種時才載入 K 線。
-    if (!hasSelectedKlineCoin) return;
-
-    final requestId = ++_klineRequestSerial;
+  Future<void> _loadDashboardData() async {
+    if (selectedCoins.isEmpty) return;
+    final requestId = ++_requestSerial;
 
     setState(() {
+      isLoading = true;
       isKlineLoading = true;
+      isCryptoLoading = true;
+      errorMessage = null;
       klineErrorMessage = null;
+      cryptoErrorMessage = null;
+      inspectedKlineCandle = null;
+      inspectedKlineCoin = null;
     });
 
     try {
-      final result = await KlineApi.fetchCandles();
-      if (!mounted || requestId != _klineRequestSerial) return;
-
-      final availableSelected = selectedKlineCoins
-          .where((coin) => result[coin]?.isNotEmpty ?? false)
-          .toList(growable: false);
+      final snapshot = await DashboardApi.fetchSnapshot();
+      if (!mounted || requestId != _requestSerial) return;
+      final updatedAt = DateTime.now();
 
       setState(() {
-        klineDataByCoin = result;
+        stablecoinPayload = snapshot.stablecoinPayload;
+        stablecoinModelInfoByCoin = snapshot.stablecoinModelInfo;
+        cryptoOverviewByCoin = snapshot.cryptos;
+        klineDataByCoin = snapshot.klines;
+        _updateStablecoinRiskFromCache();
+
+        final availableSelected = selectedKlineCoins
+            .where((coin) => snapshot.klines[coin]?.isNotEmpty ?? false)
+            .toList(growable: false);
         if (availableSelected.isNotEmpty &&
             !availableSelected.contains(selectedKlineCoin)) {
           selectedKlineCoin = availableSelected.first;
         }
-        klineLastUpdatedAt = DateTime.now();
-      });
-    } on TimeoutException {
-      if (!mounted || requestId != _klineRequestSerial) return;
-      setState(() {
-        klineErrorMessage = 'K 線 API 連線逾時，請確認後端服務是否正常運作。';
-      });
-    } on FormatException catch (error) {
-      if (!mounted || requestId != _klineRequestSerial) return;
-      setState(() {
-        klineErrorMessage = 'K 線 JSON 格式錯誤：${error.message}';
-      });
-    } catch (error) {
-      if (!mounted || requestId != _klineRequestSerial) return;
-      setState(() {
-        klineErrorMessage = 'K 線資料讀取失敗：$error';
-      });
-    } finally {
-      if (mounted && requestId == _klineRequestSerial) {
-        setState(() {
-          isKlineLoading = false;
-        });
-      }
-    }
-  }
+        inspectedKlineCandle = null;
+        inspectedKlineCoin = null;
 
-  /// 讀取目前所有所選幣種與模型的資料。
-  Future<void> _loadStablecoinRisk() async {
-    if (!canLoadStablecoinData) {
-      return;
-    }
-
-    // 保存這次請求的幣種與模型，避免等待期間切換選項造成資料錯置。
-    final requestId = ++_requestSerial;
-    final requestedCoins = List<String>.from(selectedStablecoins);
-    final requestedModels = List<String>.from(selectedModels);
-
-    setState(() {
-      isLoading = true;
-      errorMessage = null;
-    });
-
-    try {
-      // USDC 與 TUSD 共用同一個 API 回傳。
-      final payload = await StablecoinRiskApi.fetchPayload();
-      final parsedData = <String, Map<String, StablecoinModelMetrics>>{};
-
-      // 逐一解析每一個「幣種 × 模型」組合。
-      for (final coin in requestedCoins) {
-        final coinData = <String, StablecoinModelMetrics>{};
-
-        for (final model in requestedModels) {
-          final prefix = _jsonPrefixFor(coin, model);
-          coinData[model] = StablecoinModelMetrics.fromPayload(payload, prefix);
-        }
-
-        parsedData[coin] = coinData;
-      }
-
-      if (!mounted || requestId != _requestSerial) return;
-
-      // 如果幣種或模型在 API 回來前已改變，就忽略舊結果。
-      if (!_sameStringList(requestedCoins, selectedStablecoins) ||
-          !_sameStringList(requestedModels, selectedModels)) {
-        return;
-      }
-
-      setState(() {
-        modelRiskData = parsedData;
-        lastUpdatedAt = DateTime.now();
+        lastUpdatedAt = updatedAt;
+        klineLastUpdatedAt = updatedAt;
+        cryptoLastUpdatedAt = updatedAt;
       });
     } on TimeoutException {
       if (!mounted || requestId != _requestSerial) return;
-
       setState(() {
-        errorMessage = 'API 連線逾時，請確認後端服務是否正常運作。';
+        const message = '資料連線逾時；Render 免費主機喚醒時可能需要約一分鐘，請稍後重試。';
+        errorMessage = message;
+        klineErrorMessage = message;
+        cryptoErrorMessage = message;
       });
     } on FormatException catch (error) {
       if (!mounted || requestId != _requestSerial) return;
-
       setState(() {
-        errorMessage = 'JSON 格式錯誤：${error.message}';
+        final message = 'JSON 格式錯誤：${error.message}';
+        errorMessage = message;
+        klineErrorMessage = message;
+        cryptoErrorMessage = message;
       });
     } catch (error) {
       if (!mounted || requestId != _requestSerial) return;
-
       setState(() {
-        errorMessage = '讀取資料失敗：$error';
+        final message = '讀取資料失敗：$error';
+        errorMessage = message;
+        klineErrorMessage = message;
+        cryptoErrorMessage = message;
       });
     } finally {
       if (mounted && requestId == _requestSerial) {
         setState(() {
           isLoading = false;
+          isKlineLoading = false;
+          isCryptoLoading = false;
         });
       }
     }
   }
 
-  /// 讀取所有加密貨幣；只在畫面上顯示所選幣種。
-  Future<void> _loadCryptoOverview() async {
-    if (!hasSelectedCrypto) return;
-    final requestId = ++_cryptoRequestSerial;
-    final requestedCoins = List<String>.from(selectedCryptos);
-    setState(() {
-      isCryptoLoading = true;
-      cryptoErrorMessage = null;
-    });
-    try {
-      final parsed = await CryptoOverviewApi.fetchPayload();
-      if (!mounted || requestId != _cryptoRequestSerial ||
-          !_sameStringList(requestedCoins, selectedCryptos)) return;
-      setState(() {
-        cryptoOverviewByCoin = parsed;
-        // 摘要與 K 線使用同一次回應，改選幣種時也同步更新圖表。
-        klineDataByCoin = {
-          ...klineDataByCoin,
-          for (final entry in parsed.entries) entry.key: entry.value.candles,
-        };
-        final updatedAt = DateTime.now();
-        cryptoLastUpdatedAt = updatedAt;
-        klineLastUpdatedAt = updatedAt;
-      });
-    } on TimeoutException {
-      if (!mounted || requestId != _cryptoRequestSerial) return;
-      setState(() {
-        cryptoErrorMessage = '加密貨幣 API 連線逾時，請確認後端服務是否正常運作。';
-      });
-    } on FormatException catch (error) {
-      if (!mounted || requestId != _cryptoRequestSerial) return;
-      setState(() {
-        cryptoErrorMessage = '加密貨幣 JSON 格式錯誤：${error.message}';
-      });
-    } catch (error) {
-      if (!mounted || requestId != _cryptoRequestSerial) return;
-      setState(() {
-        cryptoErrorMessage = '加密貨幣資料讀取失敗：$error';
-      });
-    } finally {
-      if (mounted && requestId == _cryptoRequestSerial) {
-        setState(() { isCryptoLoading = false; });
+  void _updateStablecoinRiskFromCache() {
+    final parsedData = <String, Map<String, StablecoinModelMetrics>>{};
+    for (final coin in selectedStablecoins) {
+      final coinData = <String, StablecoinModelMetrics>{};
+      for (final model in selectedModels) {
+        final prefix = _jsonPrefixFor(coin, model);
+        coinData[model] = StablecoinModelMetrics.fromPayload(
+          stablecoinPayload,
+          prefix,
+        );
       }
+      parsedData[coin] = coinData;
     }
+    modelRiskData = parsedData;
   }
 
-  Future<void> _refreshSelectedData() async {
-    if (isStableCoinCategory && canLoadStablecoinData) {
-      await Future.wait([_loadStablecoinRisk(), _loadKlineData()]);
-      return;
-    }
-
-    if (isCryptoCategory && hasSelectedCrypto) {
-      await Future.wait([_loadCryptoOverview(), _loadKlineData()]);
-    }
-  }
+  Future<void> _loadKlineData() => _loadDashboardData();
+  Future<void> _loadStablecoinRisk() => _loadDashboardData();
+  Future<void> _loadCryptoOverview() => _loadDashboardData();
+  Future<void> _refreshSelectedData() => _loadDashboardData();
 
   void _resetCryptoResult() {
-    _cryptoRequestSerial++;
     isCryptoLoading = false;
-    cryptoOverviewByCoin = {};
     cryptoErrorMessage = null;
-    cryptoLastUpdatedAt = null;
-  }
-
-  bool _sameStringList(List<String> a, List<String> b) {
-    if (a.length != b.length) return false;
-
-    return a.toSet().containsAll(b) && b.toSet().containsAll(a);
   }
 
   /// 清除目前 API 結果，但不直接清空左側選項。
@@ -844,7 +874,6 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     isLoading = false;
     modelRiskData = {};
     errorMessage = null;
-    lastUpdatedAt = null;
   }
 
   bool _hasSelectedCategory(String category) {
@@ -859,12 +888,9 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
 
   /// 切換幣種；同一分類中的幣種可複選。
   void _toggleCoin(String category, String coin) {
-    var shouldReloadStablecoin = false;
-    var shouldLoadKline = false;
-    var shouldLoadCrypto = false;
+    var shouldLoadDashboard = false;
 
     setState(() {
-      // 切換分類時，清空另一分類的選擇與資料。
       if (selectedCategory != category) {
         selectedCategory = category;
         selectedCoins.clear();
@@ -877,59 +903,38 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         selectedCoins.remove(coin);
       } else {
         selectedCoins.add(coin);
+        selectedKlineCoin = coin;
       }
+      inspectedKlineCandle = null;
+      inspectedKlineCoin = null;
 
       if (category == '穩定幣') {
-        // 點選穩定幣時，右側 K 線同步切換到該幣種。
-        if (selectedCoins.contains(coin)) {
-          selectedKlineCoin = coin;
-        } else if (selectedKlineCoin == coin && selectedCoins.isNotEmpty) {
-          selectedKlineCoin = selectedCoins.first;
-        }
-
         if (selectedCoins.isEmpty) {
           selectedModels.clear();
         }
-
-        _resetApiResult();
-        shouldReloadStablecoin = canLoadStablecoinData;
       } else {
-        // 一般加密貨幣不使用穩定幣模型。
         selectedModels.clear();
         _resetApiResult();
         _resetCryptoResult();
-
-        if (hasSelectedCrypto) {
-          // 新勾選的幣種切換到對應 K 線；取消目前幣種時回到其他所選幣種。
-          if (selectedCoins.contains(coin)) {
-            selectedKlineCoin = coin;
-          } else if (!selectedCryptos.contains(selectedKlineCoin)) {
-            selectedKlineCoin = selectedCryptos.first;
-          }
-          shouldLoadCrypto = true;
-        }
       }
 
-      shouldLoadKline =
-          hasSelectedKlineCoin &&
-          (klineDataByCoin[selectedKlineCoin]?.isEmpty ?? true) &&
-          !isKlineLoading;
+      if (selectedKlineCoin == coin && !selectedCoins.contains(coin)) {
+        if (selectedCoins.isNotEmpty) selectedKlineCoin = selectedCoins.first;
+      }
+
+      if (stablecoinPayload.isNotEmpty) {
+        _updateStablecoinRiskFromCache();
+      }
+      shouldLoadDashboard =
+          selectedCoins.isNotEmpty &&
+          klineDataByCoin.isEmpty &&
+          !isSelectedDataLoading;
     });
 
-    if (shouldLoadKline) {
-      _loadKlineData();
-    }
-
-    if (shouldReloadStablecoin) {
-      _loadStablecoinRisk();
-    }
-
-    if (shouldLoadCrypto) {
-      _loadCryptoOverview();
-    }
+    if (shouldLoadDashboard) _loadDashboardData();
   }
 
-  /// 模型可複選；每次改選後重新抓取所有所選幣種的資料。
+  /// 模型可複選；後端完整結果已載入時只需重新整理畫面資料。
   void _toggleModel(String model) {
     if (!hasSelectedStablecoin) {
       return;
@@ -942,11 +947,16 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         selectedModels.add(model);
       }
 
-      _resetApiResult();
+      errorMessage = null;
+      if (stablecoinPayload.isNotEmpty) {
+        _updateStablecoinRiskFromCache();
+      }
     });
 
-    if (canLoadStablecoinData) {
-      _loadStablecoinRisk();
+    if (canLoadStablecoinData &&
+        stablecoinPayload.isEmpty &&
+        !isSelectedDataLoading) {
+      _loadDashboardData();
     }
   }
 
@@ -957,9 +967,12 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       selectedModels.clear();
       _resetApiResult();
       _resetCryptoResult();
-      _klineRequestSerial++;
+      _requestSerial++;
       isKlineLoading = false;
+      isCryptoLoading = false;
       klineErrorMessage = null;
+      inspectedKlineCandle = null;
+      inspectedKlineCoin = null;
     });
   }
 
@@ -974,8 +987,9 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final isDesktop = constraints.maxWidth >= 900;
+            final isMobile = constraints.maxWidth < 600;
             final leftPanel = _buildLeftPanel();
-            final rightPanel = _buildRightPanel();
+            final rightPanel = _buildRightPanel(isMobile: isMobile);
 
             final content = isDesktop
                 ? Row(
@@ -1013,68 +1027,66 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-            const Text(
-              '加密貨幣儀表板',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.w700),
+          const Text(
+            '加密貨幣儀表板',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '一般加密貨幣可複選 BTC、ETH、SOL、XRP；'
+            '穩定幣可複選 USDC、TUSD 與分類模型；結果區另列迴歸模型比較。',
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.5,
+              color: Colors.white.withValues(alpha: 0.55),
             ),
-            const SizedBox(height: 8),
-            Text(
-              '一般加密貨幣可複選 BTC、ETH、SOL、XRP，查看 K 線與趨勢分數；'
-              '穩定幣則可複選 USDC/TUSD 與預測模型。',
-              style: TextStyle(
-                fontSize: 13,
-                height: 1.5,
-                color: Colors.white.withValues(alpha: 0.55),
-              ),
+          ),
+          const SizedBox(height: 32),
+          _buildHoverCategoryMenu(
+            category: '加密貨幣',
+            subtitle: 'BTC、ETH、SOL、XRP 的 4h 趨勢預測',
+            coins: cryptoCoins,
+            showModels: false,
+          ),
+          const SizedBox(height: 12),
+          _buildHoverCategoryMenu(
+            category: '穩定幣',
+            subtitle: 'USDC、TUSD、三個分類模型與兩個迴歸模型',
+            coins: stableCoins,
+            showModels: true,
+          ),
+          if (selectedCoins.isNotEmpty || selectedModels.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            _buildSelectedSummary(),
+          ],
+          const SizedBox(height: 18),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: !canRefreshSelectedData || isSelectedDataLoading
+                  ? null
+                  : _refreshSelectedData,
+              icon: const Icon(Icons.refresh_rounded),
+              label: Text(isSelectedDataLoading ? '讀取中...' : '重新抓取資料'),
             ),
-            const SizedBox(height: 32),
-            _buildHoverCategoryMenu(
-              category: '加密貨幣',
-              subtitle: 'BTC、ETH、SOL、XRP 趨勢與 K 線',
-              coins: cryptoCoins,
-              showModels: false,
-            ),
-            const SizedBox(height: 12),
-            _buildHoverCategoryMenu(
-              category: '穩定幣',
-              subtitle: 'USDC、TUSD 與四種預測模型',
-              coins: stableCoins,
-              showModels: true,
-            ),
-            if (selectedCoins.isNotEmpty || selectedModels.isNotEmpty) ...[
-              const SizedBox(height: 24),
-              _buildSelectedSummary(),
-            ],
-            const SizedBox(height: 18),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: !canRefreshSelectedData || isSelectedDataLoading
-                    ? null
-                    : _refreshSelectedData,
-                icon: const Icon(Icons.refresh_rounded),
-                label: Text(isSelectedDataLoading ? '讀取中...' : '重新抓取資料'),
-              ),
-            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildRightPanel() {
+  Widget _buildRightPanel({required bool isMobile}) {
     final viewportHeight = MediaQuery.sizeOf(context).height;
-    final chartHeight = (viewportHeight * 0.62)
-        .clamp(420.0, 560.0)
-        .toDouble();
+    final chartHeight = isMobile
+        ? 480.0
+        : (viewportHeight * 0.62).clamp(420.0, 560.0).toDouble() + 40.0;
 
     // 只要目前「沒有實際選到任何幣種或模型」，
     // 不論 selectedCategory 是否仍保留先前的分類，都視為空白狀態。
     //
     // 這樣使用者把左側 USDC / TUSD 等選項逐一取消後，
     // 右側資料顯示區就會恢復成初始的大尺寸，不會縮成 220 px。
-    final isEmptySelection =
-        selectedCoins.isEmpty &&
-        selectedModels.isEmpty;
+    final isEmptySelection = selectedCoins.isEmpty && selectedModels.isEmpty;
 
     // 空白狀態約佔視窗高度 70%，並限制在 520～650 px。
     // 有實際選擇時才恢復原本較精簡的高度。
@@ -1088,24 +1100,34 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 左側選到幣種時顯示右上方 K 線圖。
+          // 左側選到 USDC/TUSD 或 BTC 時顯示右上方 K 線圖。
           if (hasSelectedKlineCoin) ...[
-            SizedBox(height: chartHeight, child: _buildKlinePanel()),
+            SizedBox(
+              height: chartHeight,
+              child: _buildKlinePanel(isMobile: isMobile),
+            ),
             const SizedBox(height: 16),
           ],
           ConstrainedBox(
             constraints: BoxConstraints(minHeight: resultPanelMinHeight),
             child: _buildApiResultPanel(),
           ),
+          const SizedBox(height: 16),
+          _buildDisclaimerPanel(),
         ],
       ),
     );
   }
 
-  Widget _buildKlinePanel() {
+  Widget _buildKlinePanel({required bool isMobile}) {
     final candles = activeKlineData;
     final latest = candles.isEmpty ? null : candles.last;
-    final latestColor = latest == null || latest.close >= latest.open
+    final inspected = inspectedKlineCoin == selectedKlineCoin
+        ? inspectedKlineCandle
+        : null;
+    final displayed = inspected ?? latest;
+    final displayedColor =
+        displayed == null || displayed.close >= displayed.open
         ? const Color(0xFFFF453A)
         : const Color(0xFF30D158);
 
@@ -1133,7 +1155,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '$selectedKlineCoin K 線圖',
+                      '$selectedKlineCoin 1h K 線圖',
                       style: const TextStyle(
                         fontSize: 21,
                         fontWeight: FontWeight.w700,
@@ -1169,38 +1191,59 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
             ],
           ),
           const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
+          Row(
             children: [
-              // 顯示目前分類中的已選幣種；無資料的按鈕會停用。
-              for (final coin in selectedKlineCoins)
-                _buildKlineCoinButton(coin),
-              Text(
-                '${candles.length} 根 K 棒 · ${cryptoOverviewByCoin[selectedKlineCoin]?.klineInterval ?? '1h'}',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white.withValues(alpha: 0.42),
+              // 只顯示目前分類中有後端 K 線資料的已選幣種。
+              for (int i = 0; i < selectedKlineCoins.length; i++) ...[
+                if (i > 0) const SizedBox(width: 8),
+                _buildKlineCoinButton(selectedKlineCoins[i]),
+              ],
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  isMobile
+                      ? '${candles.length} 根 · 點選鎖定 · 滑動平移'
+                      : '${candles.length} 根 · 滑鼠查看／點擊鎖定 · 拖曳平移 · 滾輪縮放',
+                  maxLines: 2,
+                  textAlign: TextAlign.right,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.white.withValues(alpha: 0.42),
+                  ),
                 ),
               ),
             ],
           ),
-          if (latest != null) ...[
+          if (displayed != null) ...[
             const SizedBox(height: 12),
+            Text(
+              inspected == null
+                  ? '最新 1h K 棒 · ${_formatTime(displayed.time)}'
+                  : '指定 1h K 棒 · ${_formatTime(displayed.time)}',
+              style: TextStyle(
+                fontSize: 11,
+                color: inspected == null
+                    ? Colors.white.withValues(alpha: 0.42)
+                    : const Color(0xFF64D2FF),
+              ),
+            ),
+            const SizedBox(height: 5),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _buildKlineValue('開', _formatKlineNumber(latest.open)),
-                  _buildKlineValue('高', _formatKlineNumber(latest.high)),
-                  _buildKlineValue('低', _formatKlineNumber(latest.low)),
+                  _buildKlineValue('開', _formatKlineNumber(displayed.open)),
+                  _buildKlineValue('高', _formatKlineNumber(displayed.high)),
+                  _buildKlineValue('低', _formatKlineNumber(displayed.low)),
                   _buildKlineValue(
                     '收',
-                    _formatKlineNumber(latest.close),
-                    valueColor: latestColor,
+                    _formatKlineNumber(displayed.close),
+                    valueColor: displayedColor,
                   ),
-                  _buildKlineValue('量', _formatVolume(latest.volume)),
+                  _buildKlineValue(
+                    '成交量 ($selectedKlineCoin)',
+                    _formatVolume(displayed.volume),
+                  ),
                 ],
               ),
             ),
@@ -1215,20 +1258,20 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
             ),
           ],
           const SizedBox(height: 8),
-          Expanded(child: _buildKlineChartBody()),
+          Expanded(child: _buildKlineChartBody(isMobile: isMobile)),
         ],
       ),
     );
   }
 
-  Widget _buildKlineChartBody() {
+  Widget _buildKlineChartBody({required bool isMobile}) {
     final candles = activeKlineData;
 
-    if (isKlineLoading && candles.isEmpty) {
+    if (isKlineLoading && klineDataByCoin.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (klineErrorMessage != null && candles.isEmpty) {
+    if (klineErrorMessage != null && klineDataByCoin.isEmpty) {
       return Center(
         child: SingleChildScrollView(
           child: Column(
@@ -1265,7 +1308,17 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       );
     }
 
-    return InteractiveCandlestickChart(candles: candles);
+    return InteractiveCandlestickChart(
+      candles: candles,
+      mobileMode: isMobile,
+      onInspectionChanged: (candle) {
+        if (!mounted) return;
+        setState(() {
+          inspectedKlineCandle = candle;
+          inspectedKlineCoin = candle == null ? null : selectedKlineCoin;
+        });
+      },
+    );
   }
 
   Widget _buildKlineCoinButton(String coin) {
@@ -1282,6 +1335,8 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
             ? () {
                 setState(() {
                   selectedKlineCoin = coin;
+                  inspectedKlineCandle = null;
+                  inspectedKlineCoin = null;
                 });
               }
             : null,
@@ -1399,7 +1454,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       return _buildEmptyState(
         icon: Icons.model_training_rounded,
         title: '請選擇預測模型',
-        message: '目前幣種為 ${coins.join('、')}；四個模型皆支援同時複選。',
+        message: '目前幣種為 ${coins.join('、')}；三個分類模型皆支援同時複選。',
       );
     }
 
@@ -1444,7 +1499,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         ),
         const SizedBox(height: 6),
         Text(
-          '已選幣種：${coins.join('、')}　｜　已選模型：${selectedModels.join('、')}',
+          '已選幣種：${coins.join('、')}　｜　已選模型：${selectedModels.map(_displayModelName).join('、')}',
           style: TextStyle(
             fontSize: 12,
             color: Colors.white.withValues(alpha: 0.45),
@@ -1465,11 +1520,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
           _buildWarningBanner(errorMessage!),
         ],
         const SizedBox(height: 12),
-        for (
-          int coinIndex = 0;
-          coinIndex < coins.length;
-          coinIndex++
-        ) ...[
+        for (int coinIndex = 0; coinIndex < coins.length; coinIndex++) ...[
           _buildCoinResultSection(coin: coins[coinIndex]),
           if (coinIndex != coins.length - 1) const SizedBox(height: 20),
         ],
@@ -1479,279 +1530,432 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
 
   Widget _buildCryptoResultPanel() {
     final coins = selectedCryptos;
-    final selectedData = <CryptoOverviewData>[
-      for (final coin in coins)
-        if (cryptoOverviewByCoin[coin] != null) cryptoOverviewByCoin[coin]!,
-    ];
-    final horizons = selectedData
-        .map((data) => data.predictionHorizonHours)
-        .toSet();
-    final predictionRangeNote = horizons.isEmpty
-        ? '預測時間範圍：資料載入後顯示'
-        : horizons.length == 1
-            ? '預測時間範圍：未來 ${horizons.single} 小時'
-            : '預測時間範圍：${selectedData.map((data) => '${data.coin} ${data.predictionHorizonHours} 小時').join('、')}';
+
     if (coins.isEmpty) {
       return _buildEmptyState(
         icon: Icons.currency_bitcoin_rounded,
         title: '請選擇加密貨幣',
-        message: '在左側選擇 BTC、ETH、SOL 或 XRP，可同時查看多種幣的趨勢。',
+        message: '可複選 BTC、ETH、SOL、XRP，查看 4h 趨勢預測與 1h K 線。',
       );
     }
+
     if (isCryptoLoading && cryptoOverviewByCoin.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
+
     if (cryptoErrorMessage != null && cryptoOverviewByCoin.isEmpty) {
       return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.error_outline_rounded, color: Colors.redAccent),
-            const SizedBox(height: 12),
-            SelectableText(
-              cryptoErrorMessage!,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.redAccent, height: 1.5),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _loadCryptoOverview,
-              icon: const Icon(Icons.refresh_rounded),
-              label: const Text('重試'),
-            ),
-          ],
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 560),
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.redAccent.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.redAccent.withValues(alpha: 0.35)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.error_outline_rounded,
+                size: 42,
+                color: Colors.redAccent,
+              ),
+              const SizedBox(height: 16),
+              SelectableText(
+                cryptoErrorMessage!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.redAccent, height: 1.5),
+              ),
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                onPressed: _loadCryptoOverview,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('重試'),
+              ),
+            ],
+          ),
         ),
       );
     }
+
+    final availableCoins = coins
+        .where(cryptoOverviewByCoin.containsKey)
+        .toList(growable: false);
+    if (availableCoins.isEmpty) {
+      return _buildEmptyState(
+        icon: Icons.cloud_download_outlined,
+        title: '尚未取得加密貨幣預測資料',
+        message: '請按下重新抓取資料。',
+      );
+    }
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           children: [
-            const Expanded(
-              child: Text('加密貨幣趨勢預測',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+            Expanded(
+              child: Text(
+                '${availableCoins.join('、')} 4h 趨勢預測',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
             ),
             if (isCryptoLoading)
-              const SizedBox(width: 18, height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
           ],
         ),
         const SizedBox(height: 6),
         Text(
-          predictionRangeNote,
+          cryptoLastUpdatedAt == null
+              ? '尚未更新'
+              : '最後更新：${_formatTime(cryptoLastUpdatedAt!)}',
           style: TextStyle(
-            fontSize: 13,
-            color: Colors.white.withValues(alpha: 0.65),
+            fontSize: 12,
+            color: Colors.white.withValues(alpha: 0.45),
           ),
         ),
-        const SizedBox(height: 4),
-        Text(
-          cryptoLastUpdatedAt == null ? '尚未更新'
-              : '最後更新：${_formatTime(cryptoLastUpdatedAt!)}',
-          style: TextStyle(fontSize: 12,
-            color: Colors.white.withValues(alpha: 0.45)),
-        ),
         if (cryptoErrorMessage != null) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
           _buildWarningBanner(cryptoErrorMessage!),
         ],
-        const SizedBox(height: 12),
-        for (final coin in coins) ...[
-          if (cryptoOverviewByCoin[coin] != null)
-            _buildCryptoCoinSection(cryptoOverviewByCoin[coin]!)
-          else
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Text('$coin 尚無後端預測資料'),
-            ),
-          const SizedBox(height: 12),
+        const SizedBox(height: 14),
+        for (int index = 0; index < availableCoins.length; index++) ...[
+          _buildCryptoCoinSection(cryptoOverviewByCoin[availableCoins[index]]!),
+          if (index != availableCoins.length - 1) const SizedBox(height: 20),
         ],
       ],
     );
   }
 
   Widget _buildCryptoCoinSection(CryptoOverviewData data) {
-    final trend = data.trendLabel.toLowerCase();
-    // 以後端 trend_label 顯示與上色，不將它改成一定上漲或下跌。
-    final trendColor = trend.contains('多') || trend.contains('bull')
-        ? const Color(0xFF30D158)
-        : trend.contains('空') || trend.contains('bear')
-            ? const Color(0xFFFF453A)
-            : const Color(0xFF64D2FF);
-    final latestClosed = data.latestClosedCandle;
-    final scoreDifference = data.scoreDifference;
+    final directionColor = _trendColor(data.trendLabel);
     final metrics = <Widget>[
       _buildCompactMetricCell(
         title: '目前價格',
-        value: latestClosed == null ? '—' : _formatCryptoUsd(latestClosed.close),
-        jsonKey: 'data.cryptos[].kline_data[].close',
-        subtitle: '最新已收盤 ${data.klineInterval} K 棒的收盤價，作為本次趨勢資料的價格基準',
+        value: _formatCryptoPrice(data.currentPrice),
+        jsonKey: 'current_price',
+        subtitle: '${data.coin} 最新 1h K 線收盤價',
         color: const Color(0xFF64D2FF),
       ),
       _buildCompactMetricCell(
-        title: '上漲分數',
-        value: '${data.upScore.toStringAsFixed(2)}／100',
-        jsonKey: 'data.cryptos[].up_score',
-        subtitle: '未來 ${data.predictionHorizonHours} 小時的模型上漲分數',
+        title: '4h 上漲分數',
+        value: _formatPercent(data.upScore),
+        jsonKey: 'up_score',
+        subtitle: '模型輸出的 4 小時上漲分數；不是保證機率',
         color: const Color(0xFFBF5AF2),
       ),
       _buildCompactMetricCell(
-        title: '判斷門檻',
-        value: _formatThreshold(data.displayThreshold),
-        jsonKey: 'data.cryptos[].display_threshold',
-        subtitle: '上漲分數的趨勢顯示門檻',
-        color: const Color(0xFFFFD60A),
-      ),
-      _buildCompactMetricCell(
         title: '距門檻差',
-        value: _formatScoreDifference(scoreDifference),
-        jsonKey: 'up_score − display_threshold',
-        subtitle: '上漲分數減去判斷門檻；正值表示高於門檻，負值表示低於門檻',
-        color: _priceDifferenceColor(scoreDifference),
+        value: _formatSignedPercentPoints(data.thresholdGap),
+        jsonKey: 'threshold_gap',
+        subtitle: '上漲分數減去模型判定門檻',
+        color: data.thresholdGap >= 0
+            ? const Color(0xFF30D158)
+            : const Color(0xFFFF453A),
       ),
       _buildCompactMetricCell(
         title: '預測方向',
         value: data.trendLabel,
-        jsonKey: 'data.cryptos[].trend_label',
-        subtitle: '模型對未來 ${data.predictionHorizonHours} 小時的趨勢判斷',
-        color: trendColor,
-      ),
-      _buildCompactMetricCell(
-        title: '模型資料截至',
-        value: latestClosed == null
-            ? '尚無已收盤資料'
-            : '${_formatHourMinute(latestClosed.time)} 已收盤',
-        jsonKey: 'timestamp + kline_interval + kline_data[].time',
-        subtitle: latestClosed == null
-            ? '尚無可確認已收盤的 K 棒'
-            : '依後端回應時間與 K 線週期推算；${_formatTime(latestClosed.time)} 起始的 K 棒已收盤。JSON 未提供獨立的模型資料截止時間',
-        color: const Color(0xFF64D2FF),
+        jsonKey: 'trend_label',
+        subtitle: '${data.modelInfo.predictionHorizonHours} 小時方向判定',
+        color: directionColor,
       ),
     ];
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(data.coin,
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+        _buildCoinHeading(data.coin),
         const SizedBox(height: 8),
-        LayoutBuilder(builder: (context, constraints) {
-          final columns = constraints.maxWidth >= 1080 ? 6
-              : constraints.maxWidth >= 600 ? 3
-              : constraints.maxWidth >= 360 ? 2 : 1;
-          const spacing = 8.0;
-          final width = (constraints.maxWidth - spacing * (columns - 1)) / columns;
-          return Wrap(
-            spacing: spacing,
-            runSpacing: spacing,
-            children: [for (final metric in metrics)
-              SizedBox(width: width, child: metric)],
-          );
-        }),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 760
+                ? 4
+                : constraints.maxWidth >= 390
+                ? 2
+                : 1;
+            const spacing = 8.0;
+            final cardWidth =
+                (constraints.maxWidth - spacing * (columns - 1)) / columns;
+            return Wrap(
+              spacing: spacing,
+              runSpacing: spacing,
+              children: [
+                for (final metric in metrics)
+                  SizedBox(width: cardWidth, child: metric),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 10),
+        _buildCryptoModelInfo(data),
       ],
     );
   }
 
-  /// 顯示單一幣種底下所有已選模型。
+  Widget _buildCryptoModelInfo(CryptoOverviewData data) {
+    final info = data.modelInfo;
+    final trainingRange = _formatCoverageRange(
+      info.trainingCoverage,
+      'train_start',
+      'train_end',
+    );
+    final validationRange = _formatCoverageRange(
+      info.trainingCoverage,
+      'validation_start',
+      'validation_end',
+    );
+    final auc = info.validationRocAuc == null
+        ? '未記錄'
+        : info.validationRocAuc!.toStringAsFixed(4);
+    return _buildModelInfoPanel(
+      title: '${data.coin} 模型介紹',
+      description:
+          '${info.modelName} 使用最近 ${info.inputKlineCount} 根 ${data.klineInterval} K 線與 '
+          '${info.featureCount} 個特徵，預測${info.predictionTarget}。',
+      items: {
+        '判定方式': info.targetDefinition,
+        '方向門檻': _formatPercent(info.displayThreshold),
+        '驗證 ROC-AUC': auc,
+        if (trainingRange.isNotEmpty) '訓練資料範圍': trainingRange,
+        if (validationRange.isNotEmpty) '驗證資料範圍': validationRange,
+        '模型資料截至': data.modelDataUntil,
+      },
+    );
+  }
+
+  String _formatCoverageRange(
+    Map<String, String> coverage,
+    String startKey,
+    String endKey,
+  ) {
+    final start = coverage[startKey];
+    final end = coverage[endKey];
+    if (start == null || end == null) return '';
+    String normalize(String value) => value.replaceFirst('+00:00', ' UTC');
+    return '${normalize(start)} ～ ${normalize(end)}';
+  }
+
+  /// 依任務顯示單一幣種的市場資料、分類監測與迴歸估計。
   Widget _buildCoinResultSection({required String coin}) {
     final coinData =
         modelRiskData[coin] ?? const <String, StablecoinModelMetrics>{};
+    final firstData = coinData.values.firstOrNull;
+    final selectedTransformer = selectedModels
+        .where(
+          (modelName) =>
+              modelName == modelTransformer0995 ||
+              modelName == modelTransformer099,
+        )
+        .firstOrNull;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: const Color(0xFF64D2FF).withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: const Color(0xFF64D2FF).withValues(alpha: 0.3),
-                ),
-              ),
-              child: Text(
-                coin,
-                style: const TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w800,
-                  color: Color(0xFF64D2FF),
-                ),
-              ),
+        _buildCoinHeading(coin),
+        if (firstData != null) ...[
+          const SizedBox(height: 10),
+          _buildTaskHeading(
+            icon: Icons.currency_exchange_rounded,
+            title: '市場資料',
+            description: '最新一根 1h K 線的收盤價，供模型輸出比較使用。',
+          ),
+          const SizedBox(height: 7),
+          SizedBox(
+            width: 260,
+            child: _buildCompactMetricCell(
+              title: '目前價格',
+              value: _formatUsd(firstData.currentPrice),
+              jsonKey: '${coin.toLowerCase()}_current_price',
+              subtitle: '$coin 最新市場價格',
+              color: const Color(0xFF64D2FF),
             ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Divider(color: Colors.white.withValues(alpha: 0.08)),
-            ),
-          ],
+          ),
+        ],
+        const SizedBox(height: 16),
+        _buildTaskHeading(
+          icon: Icons.notification_important_outlined,
+          title: '分類模型監測',
+          description: '各模型依自己的標籤輸出未校準風險分數，不視為事件發生機率。',
         ),
-        const SizedBox(height: 8),
-        for (
-          int modelIndex = 0;
-          modelIndex < selectedModels.length;
-          modelIndex++
-        ) ...[
-          if (coinData[selectedModels[modelIndex]] != null)
-            _buildModelMetricSection(
+        const SizedBox(height: 7),
+        for (final modelName in selectedModels) ...[
+          if (coinData[modelName] != null)
+            _buildClassificationModelSection(
               coin: coin,
-              modelName: selectedModels[modelIndex],
-              data: coinData[selectedModels[modelIndex]]!,
+              modelName: modelName,
+              data: coinData[modelName]!,
             ),
-          if (modelIndex != selectedModels.length - 1)
-            const SizedBox(height: 8),
+          const SizedBox(height: 8),
+        ],
+        const SizedBox(height: 8),
+        _buildTaskHeading(
+          icon: Icons.show_chart_rounded,
+          title: '迴歸模型比較',
+          description: '比較 Transformer 與 XGBoost 對未來 6 小時最低價格的估計。',
+        ),
+        const SizedBox(height: 7),
+        if (selectedTransformer != null &&
+            coinData[selectedTransformer] != null) ...[
+          _buildRegressionModelSection(
+            coin: coin,
+            modelName: 'Transformer Regression',
+            data: coinData[selectedTransformer]!,
+            jsonModelName: selectedTransformer,
+          ),
+          const SizedBox(height: 8),
+        ],
+        if (selectedModels.contains(modelXGBoost) &&
+            coinData[modelXGBoost] != null)
+          _buildRegressionModelSection(
+            coin: coin,
+            modelName: 'XGBoost Regression',
+            data: coinData[modelXGBoost]!,
+            jsonModelName: modelXGBoost,
+          ),
+        if (stablecoinModelInfoByCoin[coin] != null) ...[
+          const SizedBox(height: 16),
+          _buildStablecoinModelInfo(coin),
         ],
       ],
     );
   }
 
-  /// 顯示單一模型的五項資料。
-  ///
-  /// 每個數據都有自己的卡片；桌面寬度足夠時盡量五張排成一列，
-  /// 寬度不足時自動切換為三欄、兩欄或單欄。
-  Widget _buildModelMetricSection({
+  Widget _buildStablecoinModelInfo(String coin) {
+    final info = stablecoinModelInfoByCoin[coin]!;
+    final selectedDefinitions = selectedModels
+        .map((name) => info.models[name])
+        .whereType<StablecoinModelDefinition>()
+        .toList(growable: false);
+    final components = selectedDefinitions
+        .expand((model) => model.components)
+        .toSet()
+        .join('、');
+    final featureDetails = selectedDefinitions
+        .map((model) {
+          final counts = model.featureCounts.entries
+              .map((entry) {
+                final role = switch (entry.key) {
+                  'classifier' => '分類',
+                  'regressor' => '迴歸',
+                  _ => entry.key,
+                };
+                return '$role ${entry.value}';
+              })
+              .join('、');
+          return '${_displayModelName(model.displayName)}：$counts';
+        })
+        .join('；');
+    final classificationTargets = selectedModels
+        .map(
+          (modelName) =>
+              '${_displayModelName(modelName)}：${_classificationTarget(coin, modelName)}',
+        )
+        .join('；');
+    final regressionNames = info.regressionModels
+        .map((model) => model.displayName)
+        .join('、');
+    final regressionFeatures = info.regressionModels
+        .map((model) => '${model.displayName}：${model.featureCount}')
+        .join('；');
+    return _buildModelInfoPanel(
+      title: '$coin 模型介紹',
+      description: '本系統將即時狀態監測、未來脫鉤預警與價格迴歸分開呈現。',
+      items: {
+        '目前顯示分類模型': selectedModels.map(_displayModelName).join('、'),
+        '輸入資料': '最近 ${info.inputKlineCount} 根 ${info.klineInterval} K 線',
+        '資料集涵蓋期間': info.datasetPeriod,
+        '分類目標': classificationTargets,
+        if (regressionNames.isNotEmpty) '迴歸比較模型': regressionNames,
+        '迴歸比較口徑': 'Transformer、XGBoost：未來 6 小時最低價格',
+        if (regressionFeatures.isNotEmpty) '迴歸特徵數': regressionFeatures,
+        '輸出說明': '分類值為未校準風險分數（0–100），不是發生機率',
+        if (components.isNotEmpty) '模型組成': components,
+        if (featureDetails.isNotEmpty) '特徵數': featureDetails,
+        if (info.validationRocAuc != null)
+          '驗證 ROC-AUC': info.validationRocAuc!.toStringAsFixed(4),
+      },
+    );
+  }
+
+  Widget _buildTaskHeading({
+    required IconData icon,
+    required String title,
+    required String description,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 17, color: const Color(0xFF64D2FF)),
+        const SizedBox(width: 7),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                description,
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: Colors.white.withValues(alpha: 0.48),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _taskType(String coin, String modelName) {
+    return '未來區間預警';
+  }
+
+  String _taskHorizon(String coin, String modelName) {
+    return coin == 'USDC' ? '未來 6 小時' : '未來 24 小時';
+  }
+
+  String _regressionHorizon(String coin, String modelName) {
+    // TODO: TUSD XGBoost 舊權重仍為 24 小時目標，需換成 6 小時重訓權重。
+    return '6 小時';
+  }
+
+  Widget _buildClassificationModelSection({
     required String coin,
     required String modelName,
     required StablecoinModelMetrics data,
   }) {
     final prefix = _jsonPrefixFor(coin, modelName);
+    final displayModelName = _displayModelName(modelName);
 
     final metrics = <Widget>[
       _buildCompactMetricCell(
-        title: '目前價格',
-        value: _formatUsd(data.currentPrice),
-        jsonKey: '${prefix}_current_price',
-        subtitle: '$coin 目前市場價格',
-        color: const Color(0xFF64D2FF),
-      ),
-      _buildCompactMetricCell(
-        title: '6 小時最低價',
-        value: _formatUsd(data.future6hLow),
-        jsonKey: '${prefix}_future_6h_low',
-        subtitle: '$modelName 預測的未來六小時最低價格',
-        color: const Color(0xFFBF5AF2),
-      ),
-      _buildCompactMetricCell(
-        title: '價格差',
-        value: _formatPriceDifference(data.priceDiff),
-        jsonKey: '${prefix}_price_diff',
-        subtitle: _priceDiffSubtitle(data.priceDiff),
-        color: _priceDifferenceColor(data.priceDiff),
-      ),
-      _buildCompactMetricCell(
-        title: '脫鉤機率',
-        value: _formatPercent(data.depegProbability),
+        title: '脫鉤風險分數',
+        value: _formatRiskScore(data.riskScore),
         jsonKey: '${prefix}_depeg_probability',
-        subtitle: '$modelName 估計的 $coin 脫鉤機率',
-        color: _probabilityColor(data.depegProbability),
+        subtitle: '${_classificationTarget(coin, modelName)}；此分數不是發生機率',
+        color: _riskScoreColor(data.riskScore),
       ),
       _buildCompactMetricCell(
-        title: '風險等級',
-        value: data.riskLevel,
+        title: '監測等級',
+        value: _displayRiskLevel(data.riskLevel),
         jsonKey: '${prefix}_risk_level',
-        subtitle: '後端回傳的風險等級',
-        color: _riskLevelColor(data.riskLevel, data.depegProbability),
+        subtitle: '依風險分數區間顯示，不代表事件一定發生',
+        color: _riskLevelColor(data.riskLevel, data.riskScore),
       ),
     ];
 
@@ -1768,21 +1972,76 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
             ),
           ),
           child: Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(
-                Icons.analytics_outlined,
-                size: 15,
-                color: Color(0xFF2997FF),
+              Expanded(
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.analytics_outlined,
+                      size: 15,
+                      color: Color(0xFF2997FF),
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        displayModelName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              const SizedBox(width: 6),
+              const SizedBox(width: 8),
               Text(
-                modelName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w700,
+                _taskType(coin, modelName),
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.white.withValues(alpha: 0.55),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 7),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.025),
+            borderRadius: BorderRadius.circular(7),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+          ),
+          child: Wrap(
+            spacing: 18,
+            runSpacing: 5,
+            children: [
+              Text(
+                '預測目標：${_classificationTarget(coin, modelName)}',
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: Colors.white.withValues(alpha: 0.68),
+                ),
+              ),
+              Text(
+                '時間範圍：${_taskHorizon(coin, modelName)}',
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: Colors.white.withValues(alpha: 0.68),
+                ),
+              ),
+              Text(
+                '輸出性質：未校準風險分數',
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: Colors.white.withValues(alpha: 0.68),
                 ),
               ),
             ],
@@ -1792,11 +2051,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         LayoutBuilder(
           builder: (context, constraints) {
             final int columns;
-            if (constraints.maxWidth >= 900) {
-              columns = 5;
-            } else if (constraints.maxWidth >= 650) {
-              columns = 3;
-            } else if (constraints.maxWidth >= 390) {
+            if (constraints.maxWidth >= 390) {
               columns = 2;
             } else {
               columns = 1;
@@ -1817,6 +2072,213 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
           },
         ),
       ],
+    );
+  }
+
+  Widget _buildRegressionModelSection({
+    required String coin,
+    required String modelName,
+    required String jsonModelName,
+    required StablecoinModelMetrics data,
+  }) {
+    final prefix = _jsonPrefixFor(coin, jsonModelName);
+    final horizon = _regressionHorizon(coin, modelName);
+    final metrics = <Widget>[
+      _buildCompactMetricCell(
+        title: '$horizon最低價估計',
+        value: _formatUsd(data.future6hLow),
+        jsonKey: '${prefix}_future_6h_low',
+        subtitle: '$modelName 對未來 $horizon最低價格的估計',
+        color: const Color(0xFFBF5AF2),
+      ),
+      _buildCompactMetricCell(
+        title: '預估價差',
+        value: _formatPriceDifference(data.priceDiff),
+        jsonKey: '${prefix}_price_diff',
+        subtitle: _priceDiffSubtitle(data.priceDiff),
+        color: _priceDifferenceColor(data.priceDiff),
+      ),
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          modelName,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          '預測目標：未來 $horizon最低價格',
+          style: TextStyle(
+            fontSize: 11,
+            color: Colors.white.withValues(alpha: 0.5),
+          ),
+        ),
+        const SizedBox(height: 7),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 390 ? 2 : 1;
+            const spacing = 8.0;
+            final cardWidth =
+                (constraints.maxWidth - spacing * (columns - 1)) / columns;
+            return Wrap(
+              spacing: spacing,
+              runSpacing: spacing,
+              children: [
+                for (final metric in metrics)
+                  SizedBox(width: cardWidth, child: metric),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCoinHeading(String coin) {
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: const Color(0xFF64D2FF).withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: const Color(0xFF64D2FF).withValues(alpha: 0.3),
+            ),
+          ),
+          child: Text(
+            coin,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+              color: Color(0xFF64D2FF),
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(child: Divider(color: Colors.white.withValues(alpha: 0.08))),
+      ],
+    );
+  }
+
+  Widget _buildModelInfoPanel({
+    required String title,
+    required String description,
+    required Map<String, String> items,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2997FF).withValues(alpha: 0.055),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: const Color(0xFF2997FF).withValues(alpha: 0.22),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.model_training_rounded,
+                size: 18,
+                color: Color(0xFF64D2FF),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            description,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.55,
+              color: Colors.white.withValues(alpha: 0.72),
+            ),
+          ),
+          const SizedBox(height: 10),
+          for (final entry in items.entries) ...[
+            _buildModelInfoRow(entry.key, entry.value),
+            if (entry.key != items.keys.last) const SizedBox(height: 6),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModelInfoRow(String label, String value) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 108,
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              color: Colors.white.withValues(alpha: 0.42),
+            ),
+          ),
+        ),
+        Expanded(
+          child: SelectableText(
+            value,
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.45,
+              color: Colors.white.withValues(alpha: 0.72),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDisclaimerPanel() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.025),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.info_outline_rounded,
+            size: 18,
+            color: Colors.white.withValues(alpha: 0.45),
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Text(
+              '聲明：本系統依歷史市場資料與模型輸出提供研究資訊，僅供專題展示。'
+              '穩定幣分類模型的標籤與預測範圍依模型而異，畫面數值為未校準的風險分數，'
+              '不是事件發生機率。即時狀態監測與未來風險預警屬於不同任務，不直接合併。'
+              '所有價格估計、風險分數與預測方向皆可能失準，不構成投資建議、交易邀約或'
+              '收益保證。',
+              style: TextStyle(
+                fontSize: 11,
+                height: 1.55,
+                color: Colors.white.withValues(alpha: 0.45),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1995,6 +2457,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     required bool showModels,
   }) {
     final isHovered = hoveredCategory == category;
+    final isOpen = isHovered || expandedCategory == category;
     final hasSelection = _hasSelectedCategory(category);
     final canSelectModels = category == '穩定幣' && hasSelectedStablecoin;
 
@@ -2024,46 +2487,59 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
         ),
         child: Column(
           children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          category,
-                          style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
+            InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () {
+                setState(() {
+                  expandedCategory = expandedCategory == category
+                      ? null
+                      : category;
+                });
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 15,
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            category,
+                            style: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          subtitle,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.white.withValues(alpha: 0.48),
+                          const SizedBox(height: 4),
+                          Text(
+                            subtitle,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withValues(alpha: 0.48),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                  AnimatedRotation(
-                    turns: isHovered ? 0.5 : 0,
-                    duration: const Duration(milliseconds: 180),
-                    child: Icon(
-                      Icons.keyboard_arrow_down_rounded,
-                      color: Colors.white.withValues(alpha: 0.65),
+                    AnimatedRotation(
+                      turns: isOpen ? 0.5 : 0,
+                      duration: const Duration(milliseconds: 180),
+                      child: Icon(
+                        Icons.keyboard_arrow_down_rounded,
+                        color: Colors.white.withValues(alpha: 0.65),
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
             AnimatedSize(
               duration: const Duration(milliseconds: 220),
-              child: isHovered
+              child: isOpen
                   ? Padding(
                       padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
                       child: Column(
@@ -2083,12 +2559,14 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
                           if (showModels) ...[
                             const SizedBox(height: 14),
                             _buildSectionTitle(
-                              canSelectModels ? '模型（可複選）' : '模型（請先至少選一個穩定幣）',
+                              canSelectModels
+                                  ? '分類模型（可複選）'
+                                  : '分類模型（請先至少選一個穩定幣）',
                             ),
                             const SizedBox(height: 8),
                             ...models.map(
                               (model) => _buildMenuOption(
-                                text: model,
+                                text: _displayModelName(model),
                                 isSelected: selectedModels.contains(model),
                                 enabled: canSelectModels,
                                 onTap: () => _toggleModel(model),
@@ -2210,7 +2688,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
           if (isStableCoinCategory && selectedModels.isNotEmpty) ...[
             const SizedBox(height: 8),
             Text(
-              '模型：${selectedModels.join(', ')}',
+              '模型：${selectedModels.map(_displayModelName).join(', ')}',
               style: TextStyle(
                 fontSize: 13,
                 color: Colors.white.withValues(alpha: 0.72),
@@ -2239,33 +2717,12 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     return '\$${value.toStringAsFixed(6)}';
   }
 
-  /// 一般加密貨幣加入千分位；小額幣保留較多小數以免損失精度。
-  String _formatCryptoUsd(double value) {
-    final decimals = value.abs() >= 10 ? 2 : value.abs() >= 1 ? 4 : 6;
-    final parts = value.toStringAsFixed(decimals).split('.');
-    final integerPart = parts.first.replaceAllMapped(
-      RegExp(r'(\d)(?=(\d{3})+$)'),
-      (match) => '${match.group(1)},',
-    );
-    return '\$$integerPart.${parts.last}';
+  String _formatRiskScore(double score) {
+    return '${score.toStringAsFixed(2)} / 100';
   }
 
-  String _formatThreshold(double value) {
-    return value == value.truncateToDouble()
-        ? value.toInt().toString()
-        : value.toStringAsFixed(2);
-  }
-
-  String _formatScoreDifference(double value) {
-    // 先四捨五入，避免極小差距顯示為 +0.00 或 -0.00。
-    final rounded = (value * 100).round() / 100;
-    final sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '';
-    return '$sign${rounded.abs().toStringAsFixed(2)} 分';
-  }
-
-  String _formatHourMinute(DateTime time) {
-    return '${time.hour.toString().padLeft(2, '0')}:'
-        '${time.minute.toString().padLeft(2, '0')}';
+  String _formatCryptoPrice(double value) {
+    return '\$${_formatKlineNumber(value)}';
   }
 
   String _formatKlineNumber(double value) {
@@ -2291,6 +2748,11 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
 
   String _formatPercent(double value) {
     return '${value.toStringAsFixed(2)}%';
+  }
+
+  String _formatSignedPercentPoints(double value) {
+    final sign = value > 0 ? '+' : '';
+    return '$sign${value.toStringAsFixed(2)} 個百分點';
   }
 
   String _formatPriceDifference(double value) {
@@ -2328,14 +2790,47 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     return const Color(0xFF64D2FF);
   }
 
-  Color _probabilityColor(double probability) {
-    if (probability >= 70) return const Color(0xFFFF453A);
-    if (probability >= 30) return const Color(0xFFFFD60A);
+  Color _riskScoreColor(double score) {
+    if (score >= 70) return const Color(0xFFFF453A);
+    if (score >= 50) return const Color(0xFFFFD60A);
     return const Color(0xFF30D158);
   }
 
-  /// 優先依後端 risk_level 文字上色；無法辨識時才參考機率。
-  Color _riskLevelColor(String riskLevel, double probability) {
+  String _displayRiskLevel(String riskLevel) {
+    final normalized = riskLevel.trim().toLowerCase();
+    if (normalized.contains('high') ||
+        normalized.contains('danger') ||
+        normalized.contains('嚴重') ||
+        normalized.contains('高')) {
+      return '高風險';
+    }
+    if (normalized.contains('medium') ||
+        normalized.contains('moderate') ||
+        normalized.contains('預警') ||
+        normalized.contains('中')) {
+      return '風險預警';
+    }
+    if (normalized.contains('low') ||
+        normalized.contains('safe') ||
+        normalized.contains('安全') ||
+        normalized.contains('低')) {
+      return '低風險';
+    }
+    return riskLevel;
+  }
+
+  Color _trendColor(String trendLabel) {
+    final normalized = trendLabel.trim().toLowerCase();
+    if (normalized.contains('up') ||
+        normalized.contains('bull') ||
+        normalized.contains('上漲')) {
+      return const Color(0xFF30D158);
+    }
+    return const Color(0xFFFF453A);
+  }
+
+  /// 優先依後端 risk_level 文字上色；無法辨識時才參考風險分數。
+  Color _riskLevelColor(String riskLevel, double riskScore) {
     final normalized = riskLevel.trim().toLowerCase();
 
     if (normalized.contains('high') ||
@@ -2356,20 +2851,21 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       return const Color(0xFF30D158);
     }
 
-    return _probabilityColor(probability);
+    return _riskScoreColor(riskScore);
   }
 }
 
-/// 可用滑鼠移動查看每一根 K 棒的時間。
-///
-/// 滑鼠進入價格/成交量繪圖區後，會找出距離游標最近的 K 棒，
-/// 並將該筆資料索引交給 [CandlestickChartPainter] 畫出垂直標示線與時間標籤。
+/// 支援查看、鎖定、平移與縮放的互動式 K 線圖。
 class InteractiveCandlestickChart extends StatefulWidget {
   final List<CandlestickData> candles;
+  final bool mobileMode;
+  final ValueChanged<CandlestickData?>? onInspectionChanged;
 
   const InteractiveCandlestickChart({
     super.key,
     required this.candles,
+    required this.mobileMode,
+    this.onInspectionChanged,
   });
 
   @override
@@ -2379,81 +2875,325 @@ class InteractiveCandlestickChart extends StatefulWidget {
 
 class _InteractiveCandlestickChartState
     extends State<InteractiveCandlestickChart> {
-  int? _hoveredOriginalIndex;
+  int? _inspectedOriginalIndex;
+  bool _inspectionLocked = false;
+  Offset? _crosshairPosition;
+  int _windowOffset = 0;
+  int? _zoomVisibleCount;
+  double _dragAccumulator = 0;
+  bool _isDragging = false;
 
   @override
   void didUpdateWidget(covariant InteractiveCandlestickChart oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!identical(oldWidget.candles, widget.candles)) {
-      _hoveredOriginalIndex = null;
+    if (!identical(oldWidget.candles, widget.candles) ||
+        oldWidget.mobileMode != widget.mobileMode) {
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+      _windowOffset = 0;
+      _zoomVisibleCount = null;
+      _dragAccumulator = 0;
     }
   }
 
-  void _updateHover(Offset localPosition, Size size) {
+  double _rightAxisWidth() => widget.mobileMode ? 58.0 : 76.0;
+
+  int _visibleCount(Size size) {
+    const chartLeft = 6.0;
+    final chartRight = math.max(chartLeft + 20, size.width - _rightAxisWidth());
+    final chartWidth = chartRight - chartLeft;
+    final widthBasedCount = math.max(8, (chartWidth / 15).floor());
+    final defaultCount = widget.mobileMode ? 20 : math.min(55, widthBasedCount);
+    final targetCount = _zoomVisibleCount ?? defaultCount;
+    return math.min(widget.candles.length, targetCount);
+  }
+
+  int _maximumWindowOffset(Size size) {
+    return math.max(0, widget.candles.length - _visibleCount(size));
+  }
+
+  int? _indexAt(Offset localPosition, Size size) {
     if (widget.candles.isEmpty || size.width < 120 || size.height < 90) {
-      _clearHover();
-      return;
+      return null;
     }
 
     const chartLeft = 6.0;
-    const rightAxisWidth = 76.0;
+    final rightAxisWidth = _rightAxisWidth();
     final chartRight = math.max(chartLeft + 20, size.width - rightAxisWidth);
     final chartWidth = chartRight - chartLeft;
 
     // 滑鼠位於價格刻度區之外時，不顯示 hover。
     if (localPosition.dx < chartLeft || localPosition.dx > chartRight) {
-      _clearHover();
-      return;
+      return null;
     }
 
-    final widthBasedCount = math.max(8, (chartWidth / 15).floor());
-    final maxVisibleCount = math.min(55, widthBasedCount);
-    final visibleCount = math.min(widget.candles.length, maxVisibleCount);
+    final visibleCount = _visibleCount(size);
 
-    if (visibleCount <= 0) {
-      _clearHover();
-      return;
-    }
+    if (visibleCount <= 0) return null;
 
     final slotWidth = chartWidth / visibleCount;
     final visibleIndex = ((localPosition.dx - chartLeft) / slotWidth)
         .floor()
         .clamp(0, visibleCount - 1);
-    final firstOriginalIndex = widget.candles.length - visibleCount;
-    final originalIndex = firstOriginalIndex + visibleIndex;
+    final clampedOffset = _windowOffset.clamp(0, _maximumWindowOffset(size));
+    final windowEndIndex = widget.candles.length - clampedOffset;
+    final firstOriginalIndex = windowEndIndex - visibleCount;
+    return firstOriginalIndex + visibleIndex;
+  }
 
-    if (_hoveredOriginalIndex != originalIndex) {
-      setState(() {
-        _hoveredOriginalIndex = originalIndex;
-      });
+  void _inspectAt(
+    Offset localPosition,
+    Size size, {
+    required bool lockSelection,
+  }) {
+    if (_inspectionLocked && !lockSelection) return;
+    final originalIndex = _indexAt(localPosition, size);
+    if (originalIndex == null) {
+      if (!lockSelection) _clearInspection();
+      return;
+    }
+
+    if (lockSelection &&
+        _inspectionLocked &&
+        _inspectedOriginalIndex == originalIndex) {
+      _clearInspection();
+      return;
+    }
+
+    final changedIndex = _inspectedOriginalIndex != originalIndex;
+    setState(() {
+      _inspectedOriginalIndex = originalIndex;
+      _inspectionLocked = lockSelection;
+      _crosshairPosition = localPosition;
+    });
+    if (changedIndex || lockSelection) {
+      widget.onInspectionChanged?.call(widget.candles[originalIndex]);
     }
   }
 
-  void _clearHover() {
-    if (_hoveredOriginalIndex != null) {
-      setState(() {
-        _hoveredOriginalIndex = null;
-      });
-    }
+  void _clearInspection() {
+    if (_inspectedOriginalIndex == null && _crosshairPosition == null) return;
+    setState(() {
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+    });
+    widget.onInspectionChanged?.call(null);
+  }
+
+  void _handleHorizontalDrag(double horizontalDelta, Size size) {
+    if (widget.candles.isEmpty) return;
+    const chartLeft = 6.0;
+    final chartRight = math.max(chartLeft + 20, size.width - _rightAxisWidth());
+    final visibleCount = _visibleCount(size);
+    if (visibleCount <= 0) return;
+
+    final slotWidth = (chartRight - chartLeft) / visibleCount;
+    _dragAccumulator += horizontalDelta;
+    final candleSteps = (_dragAccumulator / slotWidth).truncate();
+    if (candleSteps == 0) return;
+
+    _dragAccumulator -= candleSteps * slotWidth;
+    final nextOffset = (_windowOffset + candleSteps).clamp(
+      0,
+      _maximumWindowOffset(size),
+    );
+    if (nextOffset == _windowOffset) return;
+
+    setState(() {
+      _windowOffset = nextOffset;
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+    });
+    widget.onInspectionChanged?.call(null);
+  }
+
+  void _setVisibleCount(int count, Size size) {
+    if (widget.candles.isEmpty) return;
+    final minimum = math.min(8, widget.candles.length);
+    final next = count.clamp(minimum, widget.candles.length);
+    if (next == _visibleCount(size)) return;
+    setState(() {
+      _zoomVisibleCount = next;
+      _windowOffset = _windowOffset.clamp(
+        0,
+        math.max(0, widget.candles.length - next),
+      );
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+    });
+    widget.onInspectionChanged?.call(null);
+  }
+
+  void _zoomBy(int candleDelta, Size size) {
+    _setVisibleCount(_visibleCount(size) + candleDelta, size);
+  }
+
+  void _moveWindowBy(int candleDelta, Size size) {
+    final nextOffset = (_windowOffset + candleDelta).clamp(
+      0,
+      _maximumWindowOffset(size),
+    );
+    if (nextOffset == _windowOffset) return;
+    setState(() {
+      _windowOffset = nextOffset;
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+    });
+    widget.onInspectionChanged?.call(null);
+  }
+
+  void _resetView() {
+    setState(() {
+      _windowOffset = 0;
+      _zoomVisibleCount = null;
+      _inspectedOriginalIndex = null;
+      _inspectionLocked = false;
+      _crosshairPosition = null;
+      _dragAccumulator = 0;
+    });
+    widget.onInspectionChanged?.call(null);
+  }
+
+  Widget _chartControls(Size size) {
+    const buttonConstraints = BoxConstraints.tightFor(width: 32, height: 32);
+
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Material(
+        color: const Color(0xE61C1C1F),
+        borderRadius: BorderRadius.circular(6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              tooltip: '放大 K 線',
+              constraints: buttonConstraints,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _zoomBy(-5, size),
+              icon: const Icon(Icons.add, size: 17),
+            ),
+            IconButton(
+              tooltip: '縮小 K 線',
+              constraints: buttonConstraints,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _zoomBy(5, size),
+              icon: const Icon(Icons.remove, size: 17),
+            ),
+            IconButton(
+              tooltip: '查看較早 K 線',
+              constraints: buttonConstraints,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              onPressed: _windowOffset < _maximumWindowOffset(size)
+                  ? () => _moveWindowBy(
+                      math.max(1, _visibleCount(size) ~/ 3),
+                      size,
+                    )
+                  : null,
+              icon: const Icon(Icons.chevron_left_rounded, size: 19),
+            ),
+            IconButton(
+              tooltip: '查看較新 K 線',
+              constraints: buttonConstraints,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              onPressed: _windowOffset > 0
+                  ? () => _moveWindowBy(
+                      -math.max(1, _visibleCount(size) ~/ 3),
+                      size,
+                    )
+                  : null,
+              icon: const Icon(Icons.chevron_right_rounded, size: 19),
+            ),
+            if (_windowOffset > 0 || _zoomVisibleCount != null)
+              TextButton.icon(
+                onPressed: _resetView,
+                icon: const Icon(Icons.last_page_rounded, size: 17),
+                label: const Text('回最新'),
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(0, 32),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  visualDensity: VisualDensity.compact,
+                  foregroundColor: const Color(0xFF64D2FF),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final size = Size(constraints.maxWidth, constraints.maxHeight);
+        const toolbarHeight = 40.0;
+        final size = Size(
+          constraints.maxWidth,
+          math.max(90.0, constraints.maxHeight - toolbarHeight),
+        );
+        final visibleCount = _visibleCount(size);
 
-        return MouseRegion(
-          cursor: SystemMouseCursors.basic,
-          onHover: (event) => _updateHover(event.localPosition, size),
-          onExit: (_) => _clearHover(),
-          child: CustomPaint(
-            painter: CandlestickChartPainter(
-              candles: widget.candles,
-              hoveredOriginalIndex: _hoveredOriginalIndex,
-            ),
-            child: const SizedBox.expand(),
+        final chart = CustomPaint(
+          painter: CandlestickChartPainter(
+            candles: widget.candles,
+            inspectedOriginalIndex: _inspectedOriginalIndex,
+            inspectionLocked: _inspectionLocked,
+            crosshairPosition: _crosshairPosition,
+            mobileMode: widget.mobileMode,
+            windowOffset: _windowOffset,
+            visibleCount: visibleCount,
           ),
+          child: const SizedBox.expand(),
+        );
+
+        final gestures = Listener(
+          onPointerSignal: (event) {
+            if (event is PointerScrollEvent) {
+              _zoomBy(event.scrollDelta.dy > 0 ? 5 : -5, size);
+            }
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (details) =>
+                _inspectAt(details.localPosition, size, lockSelection: true),
+            onHorizontalDragStart: (_) {
+              _dragAccumulator = 0;
+              _isDragging = true;
+            },
+            onHorizontalDragUpdate: (details) =>
+                _handleHorizontalDrag(details.delta.dx, size),
+            onHorizontalDragEnd: (_) => _isDragging = false,
+            onHorizontalDragCancel: () => _isDragging = false,
+            child: chart,
+          ),
+        );
+
+        return Column(
+          children: [
+            SizedBox(height: toolbarHeight, child: _chartControls(size)),
+            Expanded(
+              child: MouseRegion(
+                cursor: SystemMouseCursors.precise,
+                onHover: (event) {
+                  if (!_isDragging) {
+                    _inspectAt(event.localPosition, size, lockSelection: false);
+                  }
+                },
+                onExit: (_) {
+                  if (!_inspectionLocked) _clearInspection();
+                },
+                child: gestures,
+              ),
+            ),
+          ],
         );
       },
     );
@@ -2463,11 +3203,21 @@ class _InteractiveCandlestickChartState
 /// 不依賴第三方圖表套件的 K 線與成交量繪圖器。
 class CandlestickChartPainter extends CustomPainter {
   final List<CandlestickData> candles;
-  final int? hoveredOriginalIndex;
+  final int? inspectedOriginalIndex;
+  final bool inspectionLocked;
+  final Offset? crosshairPosition;
+  final bool mobileMode;
+  final int windowOffset;
+  final int visibleCount;
 
   const CandlestickChartPainter({
     required this.candles,
-    this.hoveredOriginalIndex,
+    this.inspectedOriginalIndex,
+    required this.inspectionLocked,
+    this.crosshairPosition,
+    required this.mobileMode,
+    required this.windowOffset,
+    required this.visibleCount,
   });
 
   static const Color _upColor = Color(0xFFFF453A);
@@ -2480,7 +3230,7 @@ class CandlestickChartPainter extends CustomPainter {
     if (candles.isEmpty || size.width < 120 || size.height < 90) return;
 
     const chartLeft = 6.0;
-    const rightAxisWidth = 76.0;
+    final rightAxisWidth = mobileMode ? 58.0 : 76.0;
     const bottomAxisHeight = 28.0;
     const priceVolumeGap = 10.0;
 
@@ -2496,17 +3246,17 @@ class CandlestickChartPainter extends CustomPainter {
 
     if (priceHeight <= 20) return;
 
-    // 減少同時顯示的數量，讓每根 K 棒更寬、更容易辨識。
-    final widthBasedCount = math.max(8, (chartWidth / 15).floor());
-    final maxVisibleCount = math.min(55, widthBasedCount);
-    final visibleCount = math.min(candles.length, maxVisibleCount);
-    final firstVisibleOriginalIndex = candles.length - visibleCount;
-    final visible = candles.sublist(firstVisibleOriginalIndex);
+    final maximumWindowOffset = math.max(0, candles.length - visibleCount);
+    final clampedWindowOffset = windowOffset.clamp(0, maximumWindowOffset);
+    final windowEndIndex = candles.length - clampedWindowOffset;
+    final firstVisibleOriginalIndex = windowEndIndex - visibleCount;
+    final visible = candles.sublist(firstVisibleOriginalIndex, windowEndIndex);
 
-    final int? hoveredVisibleIndex = hoveredOriginalIndex != null &&
-            hoveredOriginalIndex! >= firstVisibleOriginalIndex &&
-            hoveredOriginalIndex! < candles.length
-        ? hoveredOriginalIndex! - firstVisibleOriginalIndex
+    final int? inspectedVisibleIndex =
+        inspectedOriginalIndex != null &&
+            inspectedOriginalIndex! >= firstVisibleOriginalIndex &&
+            inspectedOriginalIndex! < windowEndIndex
+        ? inspectedOriginalIndex! - firstVisibleOriginalIndex
         : null;
 
     var minimumPrice = visible.first.low;
@@ -2550,7 +3300,7 @@ class CandlestickChartPainter extends CustomPainter {
         _formatAxisPrice(value, priceRange),
         Offset(chartRight + 6, y - 7),
         color: _axisTextColor,
-        fontSize: 12,
+        fontSize: mobileMode ? 10 : 12,
       );
     }
 
@@ -2638,16 +3388,43 @@ class CandlestickChartPainter extends CustomPainter {
         ..strokeWidth = 1,
     );
 
-    // 滑鼠所在 K 棒的垂直十字線。
-    if (hoveredVisibleIndex != null) {
-      final hoverX = chartLeft + slotWidth * (hoveredVisibleIndex + 0.5);
+    // 滑鼠或觸控選取 K 棒時顯示垂直、水平十字線。
+    if (inspectedVisibleIndex != null) {
+      final hoverX = chartLeft + slotWidth * (inspectedVisibleIndex + 0.5);
+      final crosshairColor = Colors.white.withValues(
+        alpha: inspectionLocked ? 0.72 : 0.46,
+      );
       canvas.drawLine(
         Offset(hoverX, chartTop),
         Offset(hoverX, chartBottom),
         Paint()
-          ..color = Colors.white.withValues(alpha: 0.46)
+          ..color = crosshairColor
           ..strokeWidth = 1,
       );
+
+      final pointerY = crosshairPosition?.dy;
+      if (pointerY != null && pointerY >= chartTop && pointerY <= priceBottom) {
+        canvas.drawLine(
+          Offset(chartLeft, pointerY),
+          Offset(chartRight, pointerY),
+          Paint()
+            ..color = crosshairColor
+            ..strokeWidth = 1,
+        );
+
+        final ratio = ((pointerY - chartTop) / priceHeight)
+            .clamp(0.0, 1.0)
+            .toDouble();
+        final crosshairPrice = maximumPrice - priceRange * ratio;
+        _drawAxisTag(
+          canvas,
+          text: _formatAxisPrice(crosshairPrice, priceRange),
+          x: chartRight + 2,
+          centerY: pointerY,
+          background: const Color(0xFF4A4A4F),
+          maximumWidth: rightAxisWidth - 2,
+        );
+      }
     }
 
     canvas.restore();
@@ -2656,7 +3433,11 @@ class CandlestickChartPainter extends CustomPainter {
     for (final index in timeIndices) {
       final centerX = chartLeft + slotWidth * (index + 0.5);
       final label = _formatTimeLabel(visible[index].time);
-      final painter = _textPainter(label, color: _axisTextColor, fontSize: 11);
+      final painter = _textPainter(
+        label,
+        color: _axisTextColor,
+        fontSize: mobileMode ? 9 : 11,
+      );
       final maximumX = math.max(chartLeft, chartRight - painter.width);
       final x = (centerX - painter.width / 2)
           .clamp(chartLeft, maximumX)
@@ -2665,15 +3446,11 @@ class CandlestickChartPainter extends CustomPainter {
     }
 
     // Hover 時在時間軸上顯示精確時間，並以深色標籤突顯。
-    if (hoveredVisibleIndex != null) {
-      final hovered = visible[hoveredVisibleIndex];
-      final hoverX = chartLeft + slotWidth * (hoveredVisibleIndex + 0.5);
-      final label = _formatFullTimeLabel(hovered.time);
-      final painter = _textPainter(
-        label,
-        color: Colors.white,
-        fontSize: 12,
-      );
+    if (inspectedVisibleIndex != null) {
+      final inspected = visible[inspectedVisibleIndex];
+      final hoverX = chartLeft + slotWidth * (inspectedVisibleIndex + 0.5);
+      final label = _formatFullTimeLabel(inspected.time);
+      final painter = _textPainter(label, color: Colors.white, fontSize: 12);
 
       const horizontalPadding = 7.0;
       const verticalPadding = 4.0;
@@ -2689,15 +3466,45 @@ class CandlestickChartPainter extends CustomPainter {
         const Radius.circular(5),
       );
 
-      canvas.drawRRect(
-        rect,
-        Paint()..color = const Color(0xFF2C2C2E),
-      );
+      canvas.drawRRect(rect, Paint()..color = const Color(0xFF2C2C2E));
       painter.paint(
         canvas,
         Offset(boxX + horizontalPadding, boxY + verticalPadding),
       );
     }
+
+    _drawAxisTag(
+      canvas,
+      text: _formatAxisPrice(visible.last.close, priceRange),
+      x: chartRight + 2,
+      centerY: latestCloseY,
+      background: visible.last.close >= visible.last.open
+          ? _upColor
+          : _downColor,
+      maximumWidth: rightAxisWidth - 2,
+    );
+  }
+
+  static void _drawAxisTag(
+    Canvas canvas, {
+    required String text,
+    required double x,
+    required double centerY,
+    required Color background,
+    required double maximumWidth,
+  }) {
+    final painter = _textPainter(text, color: Colors.white, fontSize: 10);
+    const verticalPadding = 3.0;
+    const horizontalPadding = 4.0;
+    final width = math.min(maximumWidth, painter.width + horizontalPadding * 2);
+    final height = painter.height + verticalPadding * 2;
+    final top = centerY - height / 2;
+    final rect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(x, top, width, height),
+      const Radius.circular(3),
+    );
+    canvas.drawRRect(rect, Paint()..color = background);
+    painter.paint(canvas, Offset(x + horizontalPadding, top + verticalPadding));
   }
 
   static String _formatAxisPrice(double value, double range) {
@@ -2767,6 +3574,11 @@ class CandlestickChartPainter extends CustomPainter {
   @override
   bool shouldRepaint(CandlestickChartPainter oldDelegate) {
     return oldDelegate.candles != candles ||
-        oldDelegate.hoveredOriginalIndex != hoveredOriginalIndex;
+        oldDelegate.inspectedOriginalIndex != inspectedOriginalIndex ||
+        oldDelegate.inspectionLocked != inspectionLocked ||
+        oldDelegate.crosshairPosition != crosshairPosition ||
+        oldDelegate.mobileMode != mobileMode ||
+        oldDelegate.windowOffset != windowOffset ||
+        oldDelegate.visibleCount != visibleCount;
   }
 }

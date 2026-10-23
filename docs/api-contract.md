@@ -19,7 +19,7 @@
 | XRP | `XRPUSDT` | 300 |
 
 - Binance 單次 HTTP 逾時設定：**25 秒**。
-- 後端推論請求逾時設定：**180 秒**。
+- 後端單次推論請求逾時設定：**180 秒**。遇連線錯誤或 HTTP 5xx 時，最多發送三次請求，重試間隔依序為 10 秒、20 秒；單次請求逾時不自動重試。
 - 前端預設後端主機：`https://quantproject-backend.onrender.com`。
 - 可以在編譯／啟動時透過 `--dart-define=API_BASE_URL=https://YOUR_BACKEND_HOST` 覆蓋主機網址。
 
@@ -106,6 +106,8 @@ data:
 
 TUSD 與其他模型同樣依照 `{coin}_{model}_{field}` 命名。後端也提供 `system_max_risk_probability`、`usdc_kline_data`、`tusd_kline_data`，以及 `model_info`（按 USDC、TUSD 分組的模型說明）。
 
+**分類目標提醒：** USDC Transformer 0.995／0.99 分別對應下一小時起 6 小時內最低收盤價是否低於或等於 0.995／0.99；TUSD Transformer 0.995 對應下一個 1h 時點收盤價是否低於或等於 0.995，TUSD Transformer 0.99 則為下一小時之後 24 小時內最低價是否低於 0.99。其他模型的目標請以各自訓練標籤為準。
+
 **分數與時間範圍提醒：** `depeg_probability` 是後端沿用的欄位名稱。目前前端將它當成 **0–100 的風險分數** 顯示，不能直接當成經過校準的脫鉤發生機率。雖然預估價格欄位名稱含有 `future_6h_low`，仍須依實際模型訓練目標判斷時間範圍，尤其不能只靠欄位名稱判定 TUSD 的所有模型都是 6 小時預測。
 
 目前畫面可選擇 XGBoost、Transformer 0.99、Transformer 0.995；後端也有 `ensemble` 結果，但這不代表前端已把它列為獨立選項。
@@ -123,6 +125,8 @@ TUSD 與其他模型同樣依照 `{coin}_{model}_{field}` 命名。後端也提�
 ## 錯誤處理與注意事項
 
 - Binance 回傳非 2xx、空資料或不合格式時，前端會顯示錯誤。
+- 一次 API 請求會取得所有幣種，切換幣種／分類時保留正在進行的請求，避免讓載入狀態無法結束。
+- 後端 HTTP 5xx 或連線錯誤最多三次嘗試；HTTP 4xx、`success: false` 與請求逾時不會由此重試機制自動重試。
 - 後端回傳非 2xx 或 `success: false` 時，前端會視為請求失敗；後者使用 `error_message` 顯示原因。
 - 後端推論程式目前將部分執行錯誤整理為 `{"success": false, "error_message": "..."}`，不一定會改用 4xx／5xx HTTP 狀態碼。
 - 缺少必填資料、JSON 格式錯誤或欄位型別不符，可能讓前端解析失敗；請求驗證問題也可能由 FastAPI 回傳 422。

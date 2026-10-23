@@ -496,16 +496,30 @@ class DashboardApi {
     );
 
     final uri = Uri.parse('$backendBaseUrl$overviewPath');
-    final response = await http
-        .post(
-          uri,
-          headers: const {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode({'klines': Map.fromEntries(entries)}),
-        )
-        .timeout(const Duration(seconds: 180));
+    final body = jsonEncode({'klines': Map.fromEntries(entries)});
+    // Render 免費主機閒置後會休眠，喚醒期間的請求可能直接失敗（連線錯誤或 HTTP 5xx）。
+    // 這類失敗間隔數秒後重試，最多三次；逾時代表已經等很久，不再重試。
+    late http.Response response;
+    for (var attempt = 1; ; attempt++) {
+      try {
+        response = await http
+            .post(
+              uri,
+              headers: const {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: body,
+            )
+            .timeout(const Duration(seconds: 180));
+        if (response.statusCode < 500 || attempt == 3) break;
+      } on TimeoutException {
+        rethrow;
+      } catch (_) {
+        if (attempt == 3) rethrow;
+      }
+      await Future.delayed(Duration(seconds: 10 * attempt));
+    }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
@@ -621,20 +635,24 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   }
 
   String _classificationTarget(String coin, String modelName) {
+    // 依訓練程式與標籤資料核對後的定義。
     if (coin == 'USDC') {
       if (modelName == modelTransformer0995) {
-        return '未來 6 小時最低收盤價是否低於 0.995';
+        return '下一小時起 6 小時內最低收盤價是否低於或等於 0.995';
       }
       if (modelName == modelTransformer099) {
-        return '未來 6 小時最低收盤價是否低於 0.99';
+        return '下一小時起 6 小時內最低收盤價是否低於或等於 0.99';
       }
-      return '未來 6 小時最低收盤價是否低於 0.995';
+      return '含目前這小時的 6 小時內最低收盤價是否低於 0.995';
     }
 
     if (modelName == modelTransformer0995) {
-      return '未來 24 小時最低價是否低於 0.995';
+      return '下一個 1h 時點收盤價是否低於或等於 0.995';
     }
-    return '未來 24 小時最低價是否低於 0.99';
+    if (modelName == modelTransformer099) {
+      return '下一小時之後 24 小時內最低價是否低於 0.99';
+    }
+    return '下一小時起 24 小時內最低價是否低於 0.99';
   }
 
   /// 模型顯示名稱對應 JSON 中的模型代稱。
@@ -864,14 +882,13 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
   Future<void> _refreshSelectedData() => _loadDashboardData();
 
   void _resetCryptoResult() {
-    isCryptoLoading = false;
     cryptoErrorMessage = null;
   }
 
   /// 清除目前 API 結果，但不直接清空左側選項。
+  /// 一次請求會取回所有幣種的資料，因此切換幣種或分類時不作廢進行中的請求；
+  /// 否則載入狀態會一直保留、也不會重新發送請求，畫面會持續轉圈。
   void _resetApiResult() {
-    _requestSerial++;
-    isLoading = false;
     modelRiskData = {};
     errorMessage = null;
   }
@@ -968,6 +985,7 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
       _resetApiResult();
       _resetCryptoResult();
       _requestSerial++;
+      isLoading = false;
       isKlineLoading = false;
       isCryptoLoading = false;
       klineErrorMessage = null;
@@ -1921,11 +1939,17 @@ class _CryptoDashboardPageState extends State<CryptoDashboardPage> {
     );
   }
 
+  /// Only TUSD Transformer 0.995 predicts the next 1h close; the USDC Transformers use a 6-hour window.
+  bool _isNextHourTarget(String coin, String modelName) {
+    return coin == 'TUSD' && modelName == modelTransformer0995;
+  }
+
   String _taskType(String coin, String modelName) {
-    return '未來區間預警';
+    return _isNextHourTarget(coin, modelName) ? '下一時點預警' : '未來區間預警';
   }
 
   String _taskHorizon(String coin, String modelName) {
+    if (_isNextHourTarget(coin, modelName)) return '下一根 1h K 線';
     return coin == 'USDC' ? '未來 6 小時' : '未來 24 小時';
   }
 
